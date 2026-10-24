@@ -1,0 +1,6 @@
+{
+  "name": "CauseConnect AI",
+  "description": "Volunteering that fits your causes, skills and week. Explainable AI matching, transparent eligibility verification, and volunteer-approved registrations across education, healthcare, community service, animal welfare, and more.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

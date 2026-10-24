@@ -1,0 +1,375 @@
+export type CauseCategory =
+  | 'Education'
+  | 'Healthcare'
+  | 'Community Service'
+  | 'Animal Welfare'
+  | 'Elderly Care'
+  | 'Disaster Relief'
+  | 'Environment'
+  | 'Accessibility'
+  | 'Fundraising';
+
+export type EventFormat = 'in-person' | 'online' | 'hybrid';
+
+export type BackgroundCheckStatus = 'not-required' | 'required' | 'not-confirmed';
+
+export interface Opportunity {
+  id: string;
+  title: string;
+  organization: string;
+  category: CauseCategory;
+  date: string; // e.g. "Nov 7, 2026"
+  daysOfWeek: ('Saturday' | 'Sunday' | 'Weekday')[];
+  time: string; // e.g. "10:00 AM - 1:00 PM"
+  location: string; // e.g. "Remote · online" or "Bengaluru · in-person"
+  city: string;
+  format: EventFormat;
+  minAge: number;
+  backgroundCheck: BackgroundCheckStatus;
+  skills: string[];
+  description: string;
+  sourceDomain: string; // e.g. "example.org"
+  sourceUrl: string;
+  lastRetrieved: string; // e.g. "Retrieved Oct 17, 03:00 PM"
+  slotsAvailable: number;
+  contactEmail: string;
+  image: string;
+  impactStatement: string;
+  verifiedDetails: {
+    venueVerified: boolean;
+    nonprofitStatusVerified: boolean;
+    hoursCertifiable: boolean;
+  };
+}
+
+export interface MatchExplanation {
+  totalScore: number; // 0 - 100
+  causeMatch: { score: number; max: number; explanation: string };
+  skillsMatch: { score: number; max: number; matchedSkills: string[]; missingSkills: string[] };
+  availabilityMatch: { score: number; max: number; explanation: string };
+  locationMatch: { score: number; max: number; explanation: string };
+  eligibilityStatus: 'eligible' | 'warning' | 'ineligible';
+  eligibilityNotes: string[];
+  verifiedEligibility: boolean;
+  unconfirmedFields: string[];
+}
+
+export interface VolunteerProfile {
+  name: string;
+  email: string;
+  age: number;
+  dateOfBirth?: string; // e.g. "2002-05-14"
+  phone?: string;
+  educationExperience?: string;
+  preferredLocations?: string[];
+  accessibilityRequirements?: string;
+  city: string;
+  hasBackgroundCheck: boolean;
+  backgroundCheckConsent?: boolean;
+  preferredCauses: CauseCategory[];
+  skills: string[];
+  preferredDays: ('Saturday' | 'Sunday' | 'Weekday')[];
+  preferredFormat: 'all' | 'in-person' | 'online';
+  maxDistanceMiles: number;
+  bio: string;
+}
+
+export interface Registration {
+  id: string;
+  opportunityId: string;
+  opportunityTitle: string;
+  organization: string;
+  category: CauseCategory;
+  date: string;
+  time: string;
+  location: string;
+  format: EventFormat;
+  status: 'pending_approval' | 'confirmed' | 'waitlisted' | 'completed' | 'cancelled';
+  submittedAt: string;
+  approvedByUser: boolean;
+  userNotes?: string;
+  hoursLogged?: number;
+  calendarExported?: boolean;
+}
+
+export interface AgentLog {
+  id: string;
+  timestamp: string;
+  actionType: 'scrape' | 'verify' | 'match' | 'compliance' | 'notification';
+  title: string;
+  detail: string;
+  status: 'success' | 'warning' | 'info';
+  affectedOpportunityId?: string;
+}
+
+export interface TestCase {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  expectedOutcome: string;
+  passed: boolean;
+  details: string;
+  runAt?: string;
+}
+
+export interface ImpactMetrics {
+  totalHoursVolunteered: number;
+  eventsCompleted: number;
+  upcomingEvents: number;
+  causesSupportedCount: number;
+  badgesUnlocked: { id: string; title: string; description: string; icon: string; earnedDate: string }[];
+  co2SavedKg?: number;
+  peopleImpacted?: number;
+}
+
+export type BrowserbaseVerificationStatus = 'verified_official' | 'community_listed' | 'unverified';
+
+export interface BrowserbaseOpportunity {
+  // Canonical fields as required by specification
+  title: string;
+  organization: string;
+  city: string;
+  date: string | null;
+  eligibility: string | null;
+
+  // Additional detail fields
+  event_name: string;
+  organizer_name: string;
+  description: string;
+  category: string;
+  event_date: string | null;
+  event_time: string | null;
+  location: string | null;
+  required_skills: string[];
+  registration_deadline: string | null;
+  registration_url: string | null;
+  source_url: string | null;
+  verification_status: BrowserbaseVerificationStatus;
+  match_reason: string;
+}
+
+export interface BrowserbaseSearchParams {
+  location: string;
+  interests?: string[];
+  skills?: string[];
+  preferred_date?: string | null;
+  preferred_dates?: string | null;
+  radius?: number | null;
+  max_results?: number;
+}
+
+export interface BrowserbaseSearchResponse {
+  success: boolean;
+  configured: boolean;
+  agent_name: string;
+  run_id?: string;
+  status?: string;
+  opportunities: BrowserbaseOpportunity[];
+  error?: string;
+  message?: string;
+  instructions?: string;
+  searched_at?: string;
+  source_count?: number;
+}
+
+// -------------------------------------------------------------------
+// AI Volunteer Registration & Eligibility Agent Types
+// -------------------------------------------------------------------
+
+export type ApplyPilotEligibilityOutcome = 'eligible' | 'ineligible' | 'needs_review' | 'unknown';
+
+export interface ApplyPilotFieldMapping {
+  fullName: { field: string; value: string; status: 'mapped' | 'missing' | 'user_input' };
+  email: { field: string; value: string; status: 'mapped' | 'missing' | 'user_input' };
+  phone?: { field: string; value?: string; status: 'mapped' | 'missing' | 'optional' };
+  age?: { field: string; value?: number; status: 'mapped' | 'missing' | 'optional' };
+  city?: { field: string; value?: string; status: 'mapped' | 'missing' | 'optional' };
+  skills?: { field: string; value?: string[]; status: 'mapped' | 'missing' | 'optional' };
+  experience?: { field: string; value?: string; status: 'mapped' | 'missing' | 'optional' };
+  availability?: { field: string; value?: string[]; status: 'mapped' | 'missing' | 'optional' };
+  motivationStatement?: { field: string; value: string; isGenerated: boolean; userReviewed: boolean };
+  unsupportedFields: string[];
+  requiresConsentFor: string[];
+}
+
+export type EligibilityDecision =
+  | 'Eligible'
+  | 'Ineligible'
+  | 'Needs more information'
+  | 'Awaiting consent';
+
+export interface EligibilityRuleEvaluation {
+  rule: string;
+  passed: boolean;
+  deterministic: boolean;
+  details: string;
+}
+
+export interface EligibilityResult {
+  status: EligibilityDecision;
+  applyPilotStatus?: ApplyPilotEligibilityOutcome;
+  outcomeExplanation?: string;
+  isEligible: boolean;
+  requiresBackgroundCheckConsent: boolean;
+  missingInformation: string[];
+  reasons: string[];
+  rulesEvaluated: EligibilityRuleEvaluation[];
+  minAge?: number | null;
+  maxAge?: number | null;
+  verifiedAge?: number | null;
+  hasBackgroundConsent?: boolean;
+}
+
+export type ApplicationStatus =
+  | 'draft'
+  | 'awaiting_approval'
+  | 'approved'
+  | 'submitting'
+  | 'submitted_unverified'
+  | 'verified'
+  | 'waitlisted'
+  | 'rejected'
+  | 'failed'
+  | 'verification_inconclusive';
+
+export interface ApplicationRecord {
+  id: string;
+  userId: string;
+  eventId: string;
+  eventTitle: string;
+  organization: string;
+  destinationUrl: string;
+  status: ApplicationStatus;
+  draftVersion: number;
+  actionHash: string;
+  idempotencyKey: string;
+  dataToSubmit: Record<string, any>;
+  fieldMapping?: ApplyPilotFieldMapping;
+  generatedMotivation?: string;
+  approvalTimestamp?: string;
+  approvedByUserId?: string;
+  verificationEvidence?: string;
+  confirmationReference?: string;
+  observedStatus?: string;
+  lastCheckedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  error?: string;
+}
+
+export type RegistrationWorkflowState =
+  | 'draft'
+  | 'awaiting_approval'
+  | 'approved'
+  | 'executing'
+  | 'pending_verification'
+  | 'confirmed'
+  | 'waitlisted'
+  | 'failed'
+  | 'excluded';
+
+export interface ProposedRegistrationAction {
+  proposalId: string;
+  version: number;
+  actionHash: string;
+  idempotencyKey: string;
+  opportunityId: string;
+  opportunityTitle: string;
+  organization: string;
+  destinationDomain: string;
+  destinationUrl: string;
+  volunteerId: string;
+  dataToSubmit: {
+    fullName: string;
+    email: string;
+    verifiedAge: number;
+    dateOfBirth?: string | null;
+    city: string;
+    skills: string[];
+    availability: string[];
+    experienceNotes?: string;
+    backgroundCheckConsented: boolean;
+    [key: string]: any;
+  };
+  consentRequirements: {
+    type: 'background_check' | 'terms_of_service' | 'liability_waiver';
+    description: string;
+    consented: boolean;
+  }[];
+  intendedChanges: string[];
+  eligibility: EligibilityResult;
+  state: RegistrationWorkflowState;
+  preparedAt: string;
+  expiresAt: string;
+}
+
+export interface RegistrationApprovalRecord {
+  approvalId: string;
+  proposalId: string;
+  proposalVersion: number;
+  actionHash: string;
+  idempotencyKey: string;
+  volunteerId: string;
+  approvedAt: string;
+  explicitConsentGiven: boolean;
+  backgroundCheckConsented: boolean;
+  userAgent?: string;
+}
+
+export interface VerificationResult {
+  status: 'confirmed' | 'waitlisted' | 'pending' | 'failed' | 'unknown';
+  registrationId: string;
+  observedSourceUrl: string;
+  confirmationReference?: string;
+  sanitizedEvidence: string;
+  verifiedAt: string;
+  mismatches: string[];
+}
+
+export interface ActionTraceStep {
+  step: string;
+  timestamp: string;
+  status: 'ok' | 'blocked' | 'warning' | 'error';
+  detail: string;
+}
+
+export interface OfficialTestRun {
+  testCaseId: 'TC1' | 'TC2' | 'TC3' | 'TC4';
+  scenarioLabel: string;
+  inputFixture: {
+    volunteer: {
+      name: string;
+      email: string;
+      age: number;
+      dateOfBirth?: string;
+      city: string;
+      skills: string[];
+      availability: string[];
+      hasBackgroundCheckConsent: boolean;
+    };
+    opportunity: {
+      id: string;
+      title: string;
+      organization: string;
+      minAge: number;
+      backgroundCheckRequired: boolean;
+      requiredSkills: string[];
+      schedule: string[];
+      destinationUrl: string;
+    };
+    testMode: boolean;
+    testDestinationLabel?: string;
+  };
+  expectedResult: string;
+  actualResult: string;
+  status: 'passed' | 'failed' | 'blocked';
+  timestamp: string;
+  browserbaseSessionId?: string | null;
+  sanitizedEvidence: string;
+  observedSourceUrl: string;
+  approvedProposalVersion?: number;
+  idempotencyKey?: string;
+  errorDetails?: string | null;
+  actionTrace: ActionTraceStep[];
+}
