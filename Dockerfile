@@ -44,8 +44,7 @@ WORKDIR /app
 # Copy dependency manifests
 COPY package.json package-lock.json* bun.lock* ./
 
-# Install npm dependencies
-RUN npm install
+RUN npm install --legacy-peer-deps
 
 # Download Playwright Chromium binary
 RUN npx playwright install chromium
