@@ -49,8 +49,14 @@ interface RegistrationModalProps {
   userProfile: VolunteerProfile;
   isOpen: boolean;
   onClose: () => void;
-  onConfirmRegistration: (opportunity: Opportunity, userNotes: string) => Promise<{ success: boolean; error: string | null; registration?: Registration }>;
+  onConfirmRegistration: (
+    opportunity: Opportunity,
+    userNotes: string,
+    options?: { status?: string; confirmationReference?: string }
+  ) => Promise<{ success: boolean; error: string | null; registration?: Registration }>;
   onGoToRegisteredEvents: () => void;
+  onPromptSignIn?: () => void;
+  isAuthenticated?: boolean;
 }
 
 export const RegistrationModal: React.FC<RegistrationModalProps> = ({
@@ -59,7 +65,9 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
   isOpen,
   onClose,
   onConfirmRegistration,
-  onGoToRegisteredEvents
+  onGoToRegisteredEvents,
+  onPromptSignIn,
+  isAuthenticated = true
 }) => {
   // Deterministic Eligibility State
   const [eligibility, setEligibility] = useState<EligibilityResult | null>(null);
@@ -202,20 +210,29 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
         throw new Error(execRes.error || 'Failed to execute registration workflow.');
       }
 
-      // 3. Independent Verification Outcome
-      setVerificationOutcome(execRes.verificationResult);
-      if (execRes.verificationResult.status === 'waitlisted') {
-        setFinalState('waitlisted');
-      } else {
-        setFinalState('confirmed');
+      // 3. Determine verified outcome status
+      const outcomeStatus = execRes.verificationResult.status === 'waitlisted' ? 'waitlisted' : 'confirmed';
+
+      // 4. Synchronize and persist with Supabase database for the authenticated user
+      const syncRes = await onConfirmRegistration(
+        opportunity,
+        userNotes || tailoredMotivation,
+        {
+          status: outcomeStatus,
+          confirmationReference: execRes.verificationResult.confirmationReference
+        }
+      );
+
+      if (!syncRes.success) {
+        throw new Error(syncRes.error || 'Failed to persist verified registration in Supabase database.');
       }
 
-      // 4. Synchronize with Supabase database for persistence across sessions
-      const syncRes = await onConfirmRegistration(opportunity, userNotes || tailoredMotivation);
-      if (syncRes.success && syncRes.registration) {
-        setSubmittedRegistration(syncRes.registration);
-      }
+      // 5. Update UI with verified proof and confirmed state ONLY after successful database write
+      setVerificationOutcome(execRes.verificationResult);
+      setSubmittedRegistration(syncRes.registration || null);
+      setFinalState(outcomeStatus);
     } catch (err: any) {
+      console.error('[RegistrationModal] Submission error:', err);
       setExecutionError(err?.message || 'Registration execution encountered an error.');
     } finally {
       setIsExecuting(false);
@@ -376,6 +393,27 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
           ) : (
             /* Main ApplyPilot Workflow Form */
             <form onSubmit={handleApproveAndExecute} className="space-y-6">
+              {!isAuthenticated && (
+                <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <div className="flex items-start gap-2.5">
+                    <User className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold block">Sign In Required to Auto-Apply</span>
+                      <span>An authenticated volunteer account is required to link and persist your registered event.</span>
+                    </div>
+                  </div>
+                  {onPromptSignIn && (
+                    <button
+                      type="button"
+                      onClick={onPromptSignIn}
+                      className="px-3.5 py-1.5 rounded-lg bg-[#244C3A] text-white font-bold text-xs hover:bg-[#315D48] transition-colors shrink-0 cursor-pointer shadow-xs"
+                    >
+                      Sign In Now
+                    </button>
+                  )}
+                </div>
+              )}
+
               {executionError && (
                 <div className="p-4 bg-red-50 border border-red-200 rounded-xl text-xs text-red-900 flex items-start gap-2.5">
                   <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
