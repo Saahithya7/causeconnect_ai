@@ -10,7 +10,8 @@ import {
   Download,
   Trash2,
   PlusCircle,
-  ArrowRight
+  ArrowRight,
+  RefreshCw
 } from 'lucide-react';
 import { Registration } from '../types';
 
@@ -19,13 +20,15 @@ interface RegisteredEventsViewProps {
   onCancelRegistration: (id: string) => void;
   onLogHours: (id: string, hours: number) => void;
   onGoToDiscover: () => void;
+  onRefresh?: () => void;
 }
 
 export const RegisteredEventsView: React.FC<RegisteredEventsViewProps> = ({
   registrations,
   onCancelRegistration,
   onLogHours,
-  onGoToDiscover
+  onGoToDiscover,
+  onRefresh
 }) => {
   const [selectedRegForHours, setSelectedRegForHours] = useState<Registration | null>(null);
   const [hoursToLog, setHoursToLog] = useState<number>(3);
@@ -92,12 +95,24 @@ export const RegisteredEventsView: React.FC<RegisteredEventsViewProps> = ({
           </p>
         </div>
 
-        <button
-          onClick={onGoToDiscover}
-          className="px-4 py-2 text-xs sm:text-sm font-semibold rounded-xl bg-[#244C3A] text-white hover:bg-[#315D48] transition-colors self-start sm:self-auto"
-        >
-          Browse More Opportunities
-        </button>
+        <div className="flex items-center gap-2 self-start sm:self-auto">
+          {onRefresh && (
+            <button
+              onClick={onRefresh}
+              className="px-3.5 py-2 text-xs sm:text-sm font-semibold rounded-xl bg-white border border-[#D5E0D7] text-[#244C3A] hover:bg-[#DFEAE1] transition-colors flex items-center gap-1.5 cursor-pointer shadow-2xs"
+              title="Refresh registered events from Supabase database"
+            >
+              <RefreshCw className="w-3.5 h-3.5 text-[#315D48]" />
+              <span>Refresh</span>
+            </button>
+          )}
+          <button
+            onClick={onGoToDiscover}
+            className="px-4 py-2 text-xs sm:text-sm font-semibold rounded-xl bg-[#244C3A] text-white hover:bg-[#315D48] transition-colors cursor-pointer"
+          >
+            Browse More Opportunities
+          </button>
+        </div>
       </div>
 
       {registrations.length === 0 ? (
@@ -134,12 +149,22 @@ export const RegisteredEventsView: React.FC<RegisteredEventsViewProps> = ({
                     </span>
                     <span
                       className={`px-2.5 py-0.5 rounded-full text-xs font-bold ${
-                        isConfirmed
+                        reg.status === 'confirmed'
                           ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                          : 'bg-amber-50 text-amber-800 border border-amber-200'
+                          : reg.status === 'waitlisted'
+                          ? 'bg-amber-100 text-amber-900 border border-amber-300'
+                          : reg.status === 'completed'
+                          ? 'bg-purple-50 text-purple-800 border border-purple-200'
+                          : 'bg-blue-50 text-blue-800 border border-blue-200'
                       }`}
                     >
-                      {isConfirmed ? 'Registration Confirmed' : 'Pending Coordinator Approval'}
+                      {reg.status === 'confirmed'
+                        ? 'Registration Confirmed'
+                        : reg.status === 'waitlisted'
+                        ? 'On Priority Waitlist'
+                        : reg.status === 'completed'
+                        ? 'Shift Completed'
+                        : 'Pending Coordinator Verification'}
                     </span>
                     <span className="text-[11px] text-[#244C3A]/60">
                       Approved by you on {reg.submittedAt}
