@@ -10,9 +10,13 @@ import { createClient } from '@supabase/supabase-js';
 import { ensureValidUuid } from '../src/lib/uuidHelper.js';
 import { createSupabaseRegistration, getUserRegistrations } from '../src/services/supabaseService.js';
 
-const SUPABASE_URL = 'https://sgndetrsmhlkelqjsumz.supabase.co';
-const SERVICE_KEY = process.env.VITE_SUPABASE_ANON_KEY || 'sb_secret_IcQlyo6IY6oelj4b-HViuQ_l4lGmtn3';
-const ANON_KEY = 'sb_publishable_tmYz69ggBOYLpW9zTsQvEA_ZRxNrcWD';
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SERVICE_KEY = process.env.SUPABASE_SECRET_KEY;
+const ANON_KEY = process.env.SUPABASE_PUBLISHABLE_KEY;
+
+if (!SUPABASE_URL || !SERVICE_KEY || !ANON_KEY) {
+  throw new Error('Missing required Supabase test environment variables.');
+}
 
 // Known test user IDs
 const TEST_USER_A = 'afba01c0-7c92-4a1e-a5ef-539a30016ce6';
