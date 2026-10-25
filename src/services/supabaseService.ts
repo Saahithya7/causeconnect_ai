@@ -1,5 +1,10 @@
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
 import { Opportunity, VolunteerProfile, Registration, AgentLog, CauseCategory, EventFormat } from '../types';
+import { ensureValidUuid } from '../lib/uuidHelper';
+
+export const API_BASE_URL = (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_BASE_URL
+  ? String((import.meta as any).env.VITE_API_BASE_URL).replace(/\/$/, '')
+  : '');
 
 export interface SupabaseProfileRow {
   user_id: string;
@@ -240,29 +245,49 @@ export async function getOpportunitiesFromSupabase(): Promise<{
   error: string | null;
   tableExists: boolean;
 }> {
-  if (!supabase || !isSupabaseConfigured()) {
-    return { opportunities: [], error: 'Supabase client is not configured', tableExists: false };
-  }
-
   try {
-    const { data, error } = await supabase
-      .from('opportunities')
-      .select('id, title, organization_name, location, description, min_age, max_age, background_check_required, required_skills, source_url, created_at, updated_at')
-      .order('created_at', { ascending: false });
+    let rawRows: SupabaseOpportunityRow[] = [];
 
-    if (error) {
-      return {
-        opportunities: [],
-        error: error.message,
-        tableExists: !error.message?.includes('does not exist')
-      };
+    // 1. Try server API first in browser runtime to avoid client RLS restrictions
+    if (typeof window !== 'undefined') {
+      try {
+        const resp = await fetch(`${API_BASE_URL}/api/opportunities`);
+        if (resp.ok) {
+          const json = await resp.json();
+          if (json.success && Array.isArray(json.opportunities) && json.opportunities.length > 0) {
+            rawRows = json.opportunities;
+          }
+        }
+      } catch {
+        // Fall back to direct client
+      }
     }
 
-    if (!data || data.length === 0) {
+    // 2. Direct client query fallback
+    if (rawRows.length === 0 && supabase && isSupabaseConfigured()) {
+      const { data, error } = await supabase
+        .from('opportunities')
+        .select('id, title, organization_name, location, description, min_age, max_age, background_check_required, required_skills, source_url, created_at, updated_at')
+        .order('created_at', { ascending: false });
+
+      if (error && !rawRows.length) {
+        return {
+          opportunities: [],
+          error: error.message,
+          tableExists: !error.message?.includes('does not exist')
+        };
+      }
+
+      if (data && data.length > 0) {
+        rawRows = data as SupabaseOpportunityRow[];
+      }
+    }
+
+    if (!rawRows || rawRows.length === 0) {
       return { opportunities: [], error: null, tableExists: true };
     }
 
-    const mapped: Opportunity[] = (data as SupabaseOpportunityRow[]).map((row) => {
+    const mapped: Opportunity[] = rawRows.map((row) => {
       const skillsArray = Array.isArray(row.required_skills)
         ? row.required_skills
         : typeof row.required_skills === 'string'
@@ -406,23 +431,44 @@ export async function createOpportunityInSupabase(oppData: {
 /**
  * Fetch registrations for the logged-in user from public.registrations
  */
-export async function getUserRegistrations(userId: string): Promise<{
+export async function getUserRegistrations(
+  userId: string,
+  clientOverride?: any
+): Promise<{
   registrations: Registration[];
   error: string | null;
   tableExists: boolean;
 }> {
-  if (!supabase || !isSupabaseConfigured()) {
+  // 1. In browser runtime without explicit client override, fetch via backend API with service-role permissions
+  if (!clientOverride && typeof window !== 'undefined') {
+    try {
+      const resp = await fetch(`${API_BASE_URL}/api/registrations?userId=${encodeURIComponent(userId)}`);
+      if (resp.ok) {
+        const json = await resp.json();
+        if (json.success && Array.isArray(json.registrations)) {
+          return { registrations: json.registrations, error: null, tableExists: true };
+        }
+      }
+    } catch {
+      // Fall through to direct client query
+    }
+  }
+
+  // 2. Direct client query (used in Node test runners or offline)
+  const activeClient = clientOverride || supabase;
+  if (!activeClient || (!clientOverride && !isSupabaseConfigured())) {
     return { registrations: [], error: 'Supabase client is not configured', tableExists: false };
   }
 
   try {
-    const { data, error } = await supabase
+    const { data, error } = await activeClient
       .from('registrations')
-      .select('id, user_id, opportunity_id, status, submitted_at, created_at, updated_at, opportunities(*)')
+      .select('id, user_id, opportunity_id, status, confirmation_reference, submitted_at, created_at, updated_at, opportunities(*)')
       .eq('user_id', userId)
       .order('created_at', { ascending: false });
 
     if (error) {
+      console.warn('[getUserRegistrations] Query error:', error.message);
       return {
         registrations: [],
         error: error.message,
@@ -440,6 +486,21 @@ export async function getUserRegistrations(userId: string): Promise<{
       const category = opp ? inferCategory(opp.title, opp.description || '', skillsArray) : 'Community Service';
       const isRemote = opp?.location?.toLowerCase().includes('online') || opp?.location?.toLowerCase().includes('remote');
 
+      const rawStatus = (row.status || '').toLowerCase();
+      let mappedStatus: 'pending_approval' | 'confirmed' | 'waitlisted' | 'completed' | 'cancelled' = 'confirmed';
+
+      if (rawStatus === 'completed') {
+        mappedStatus = 'completed';
+      } else if (rawStatus === 'waitlisted') {
+        mappedStatus = 'waitlisted';
+      } else if (rawStatus === 'cancelled') {
+        mappedStatus = 'cancelled';
+      } else if (rawStatus === 'pending' || rawStatus === 'pending_approval' || rawStatus === 'draft' || rawStatus === 'submitting') {
+        mappedStatus = 'pending_approval';
+      } else {
+        mappedStatus = 'confirmed'; // 'confirmed', 'verified'
+      }
+
       return {
         id: String(row.id),
         opportunityId: String(row.opportunity_id),
@@ -452,11 +513,13 @@ export async function getUserRegistrations(userId: string): Promise<{
         time: '10:00 AM - 1:00 PM',
         location: opp?.location || 'Local Community Site',
         format: isRemote ? 'online' : 'in-person',
-        status: (row.status === 'completed' ? 'completed' : row.status === 'confirmed' ? 'confirmed' : 'pending_approval') as any,
-        submittedAt: row.submitted_at || row.created_at || new Date().toISOString(),
+        status: mappedStatus,
+        submittedAt: row.submitted_at
+          ? new Date(row.submitted_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+          : (row.created_at ? new Date(row.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })),
         approvedByUser: true,
         userNotes: '',
-        hoursLogged: row.status === 'completed' ? 4 : 0
+        hoursLogged: rawStatus === 'completed' ? 4 : 0
       };
     });
 
@@ -467,38 +530,153 @@ export async function getUserRegistrations(userId: string): Promise<{
 }
 
 /**
- * Create a registration in public.registrations
+ * Create or upsert a verified registration in public.registrations
  */
 export async function createSupabaseRegistration(
   userId: string,
-  opportunityId: string | number
-): Promise<{ success: boolean; id?: string; error: string | null }> {
-  if (!supabase || !isSupabaseConfigured()) {
+  opportunityId: string | number,
+  details?: {
+    opportunity?: Opportunity;
+    status?: string;
+    confirmationReference?: string;
+    userNotes?: string;
+  },
+  clientOverride?: any
+): Promise<{ success: boolean; id?: string; registration?: Registration; error: string | null }> {
+  if (!userId) {
+    return { success: false, error: 'User ID is required to persist registration' };
+  }
+
+  // 1. In browser runtime without explicit client override, persist via backend API
+  if (!clientOverride && typeof window !== 'undefined') {
+    try {
+      const resp = await fetch(`${API_BASE_URL}/api/registrations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId,
+          opportunityId,
+          opportunity: details?.opportunity,
+          status: details?.status,
+          confirmationReference: details?.confirmationReference,
+          userNotes: details?.userNotes
+        })
+      });
+
+      if (resp.ok) {
+        const json = await resp.json();
+        if (json.success && json.registration) {
+          return { success: true, id: json.registration.id, registration: json.registration, error: null };
+        } else if (json.error) {
+          return { success: false, error: json.error };
+        }
+      }
+    } catch (e: any) {
+      console.warn('[createSupabaseRegistration] Backend API notice, attempting direct fallback:', e?.message);
+    }
+  }
+
+  // 2. Direct client query (used in Node test runners or offline)
+  const activeClient = clientOverride || supabase;
+  if (!activeClient || (!clientOverride && !isSupabaseConfigured())) {
     return { success: false, error: 'Supabase client is not configured' };
   }
 
   try {
+    const oppUuid = ensureValidUuid(String(opportunityId));
+
+    // 1. Ensure opportunity exists in public.opportunities so foreign key constraint is satisfied
+    if (details?.opportunity) {
+      const opp = details.opportunity;
+      const { error: oppErr } = await activeClient.from('opportunities').upsert({
+        id: oppUuid,
+        title: opp.title,
+        organization_name: opp.organization,
+        location: opp.location,
+        description: opp.description || '',
+        source_url: opp.sourceUrl || null,
+        background_check_required: opp.backgroundCheck === 'required',
+        min_age: opp.minAge ?? 18,
+        required_skills: opp.skills || []
+      }, { onConflict: 'id' });
+
+      if (oppErr) {
+        console.warn('[createSupabaseRegistration] Opportunity upsert notice:', oppErr.message);
+      }
+    }
+
+    // 2. Persist to public.registrations
+    // Strictly map status to valid values under registrations_status_check constraint
+    const rawInputStatus = (details?.status || 'confirmed').toLowerCase();
+    let dbStatus: 'confirmed' | 'pending_approval' | 'submitted' | 'cancelled' = 'confirmed';
+    if (rawInputStatus === 'cancelled') {
+      dbStatus = 'cancelled';
+    } else if (rawInputStatus === 'submitted') {
+      dbStatus = 'submitted';
+    } else if (
+      rawInputStatus === 'pending' ||
+      rawInputStatus === 'pending_approval' ||
+      rawInputStatus === 'draft' ||
+      rawInputStatus === 'awaiting_approval' ||
+      rawInputStatus === 'submitting' ||
+      rawInputStatus === 'submitted_unverified' ||
+      rawInputStatus === 'verification_inconclusive' ||
+      rawInputStatus === 'unverified'
+    ) {
+      dbStatus = 'pending_approval';
+    } else {
+      dbStatus = 'confirmed';
+    }
+
     const payload = {
       user_id: userId,
-      opportunity_id: opportunityId,
-      status: 'pending',
+      opportunity_id: oppUuid,
+      status: dbStatus,
+      confirmation_reference: details?.confirmationReference || null,
       submitted_at: new Date().toISOString(),
-      created_at: new Date().toISOString(),
       updated_at: new Date().toISOString()
     };
 
-    const { data, error } = await supabase
+    const { data, error } = await activeClient
       .from('registrations')
-      .insert(payload)
-      .select('id')
+      .upsert(payload, { onConflict: 'user_id,opportunity_id' })
+      .select('id, user_id, opportunity_id, status, confirmation_reference, submitted_at, created_at, updated_at, opportunities(*)')
       .single();
 
     if (error) {
+      console.error('[createSupabaseRegistration] Database insert error:', error.message);
       return { success: false, error: error.message };
     }
 
-    return { success: true, id: data ? String(data.id) : undefined, error: null };
+    const row = data as any;
+    const opp = Array.isArray(row?.opportunities) ? row.opportunities[0] : row?.opportunities || details?.opportunity;
+    const skillsArray = opp?.required_skills || details?.opportunity?.skills || [];
+    const category = opp
+      ? inferCategory(opp.title, opp.description || '', skillsArray)
+      : (details?.opportunity?.category || 'Community Service');
+
+    const createdReg: Registration = {
+      id: String(row.id),
+      opportunityId: String(opportunityId),
+      opportunityTitle: opp?.title || details?.opportunity?.title || 'Volunteer Commitment',
+      organization: opp?.organization_name || details?.opportunity?.organization || 'Community Partner',
+      category,
+      date: details?.opportunity?.date || (opp?.created_at
+        ? new Date(opp.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+        : 'Upcoming Weekend'),
+      time: details?.opportunity?.time || 'Flexible Weekend Shifts',
+      location: opp?.location || details?.opportunity?.location || 'Local Community Site',
+      format: details?.opportunity?.format || (opp?.location?.toLowerCase().includes('online') ? 'online' : 'in-person'),
+      status: (rawInputStatus === 'waitlisted' ? 'waitlisted' : (dbStatus === 'pending_approval' ? 'pending_approval' : 'confirmed')) as any,
+      submittedAt: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+      approvedByUser: true,
+      userNotes: details?.userNotes || '',
+      hoursLogged: 0
+    };
+
+    return { success: true, id: String(row.id), registration: createdReg, error: null };
   } catch (err: any) {
+    console.error('[createSupabaseRegistration] Exception:', err);
     return { success: false, error: err?.message || 'Error inserting registration' };
   }
 }
