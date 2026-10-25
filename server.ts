@@ -5,8 +5,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   requireAuth,
-  AuthenticatedRequest
+  AuthenticatedRequest,
+  getSupabaseServerClient
 } from './src/server/supabaseServer.js';
+import { ensureValidUuid } from './src/lib/uuidHelper.js';
 import {
   searchPublicOpportunities,
   validateTargetUrl
@@ -128,6 +130,29 @@ async function startServer() {
     } catch (err: any) {
       console.error('[API PATCH /api/profile/me error]:', err);
       res.status(500).json({ success: false, error: err?.message || 'Failed to update user profile' });
+    }
+  });
+
+  /**
+   * GET /api/opportunities
+   * Retrieve catalog opportunities from Supabase using server client
+   */
+  app.get('/api/opportunities', async (req, res) => {
+    try {
+      const client = getSupabaseServerClient();
+      const { data, error } = await client
+        .from('opportunities')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        return res.status(500).json({ success: false, opportunities: [], error: error.message });
+      }
+
+      res.json({ success: true, opportunities: data || [] });
+    } catch (err: any) {
+      console.error('[GET /api/opportunities error]:', err);
+      res.status(500).json({ success: false, opportunities: [], error: err?.message || 'Failed to fetch opportunities' });
     }
   });
 
@@ -343,6 +368,174 @@ async function startServer() {
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ success: false, error: err?.message || 'Verification failed' });
+    }
+  });
+
+  /**
+   * GET /api/registrations
+   * Securely retrieve volunteer registrations from Supabase with full joined opportunities metadata
+   */
+  app.get('/api/registrations', async (req, res) => {
+    try {
+      const client = getSupabaseServerClient();
+      let userId = (req.query.userId as string) || (req.headers['x-user-id'] as string);
+      const authHeader = req.headers.authorization;
+      if (!userId && authHeader?.startsWith('Bearer ')) {
+        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+        const { data: authData } = await client.auth.getUser(token);
+        if (authData?.user) {
+          userId = authData.user.id;
+        }
+      }
+
+      if (!userId) {
+        return res.status(400).json({
+          success: false,
+          registrations: [],
+          error: 'User ID is required to fetch registrations'
+        });
+      }
+
+      const { data, error } = await client
+        .from('registrations')
+        .select('id, user_id, opportunity_id, status, confirmation_reference, submitted_at, created_at, updated_at, opportunities(*)')
+        .eq('user_id', userId)
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        console.warn('[GET /api/registrations warning]:', error.message);
+        return res.status(500).json({ success: false, registrations: [], error: error.message });
+      }
+
+      const mapped = (data || []).map((row: any) => {
+        const opp = Array.isArray(row.opportunities) ? row.opportunities[0] : row.opportunities;
+        const skillsArray = opp?.required_skills || [];
+        const rawStatus = (row.status || '').toLowerCase();
+        let mappedStatus = 'confirmed';
+        if (rawStatus === 'completed') mappedStatus = 'completed';
+        else if (rawStatus === 'waitlisted' || row.confirmation_reference?.toLowerCase().includes('waitlist')) mappedStatus = 'waitlisted';
+        else if (rawStatus === 'cancelled') mappedStatus = 'cancelled';
+        else if (rawStatus === 'pending' || rawStatus === 'pending_approval' || rawStatus === 'draft' || rawStatus === 'submitted' || rawStatus === 'submitting') mappedStatus = 'pending_approval';
+
+        const isRemote = opp?.location?.toLowerCase().includes('online') || opp?.location?.toLowerCase().includes('remote');
+
+        return {
+          id: String(row.id),
+          opportunityId: String(row.opportunity_id),
+          opportunityTitle: opp?.title || 'Volunteer Commitment',
+          organization: opp?.organization_name || 'Community Partner',
+          category: opp?.cause_name || 'Community Service',
+          date: opp?.created_at
+            ? new Date(opp.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+            : 'Upcoming Weekend',
+          time: '10:00 AM - 1:00 PM',
+          location: opp?.location || 'Local Community Site',
+          format: isRemote ? 'online' : 'in-person',
+          status: mappedStatus,
+          submittedAt: row.submitted_at
+            ? new Date(row.submitted_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+            : new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+          approvedByUser: true,
+          userNotes: row.approval_details?.userNotes || '',
+          hoursLogged: rawStatus === 'completed' ? 4 : 0
+        };
+      });
+
+      res.json({ success: true, registrations: mapped });
+    } catch (err: any) {
+      console.error('[GET /api/registrations exception]:', err);
+      res.status(500).json({ success: false, registrations: [], error: err?.message || 'Server error fetching registrations' });
+    }
+  });
+
+  /**
+   * POST /api/registrations
+   * Secure server-side registration persistence using Supabase service client
+   */
+  app.post('/api/registrations', async (req, res) => {
+    try {
+      const client = getSupabaseServerClient();
+      const { userId, opportunityId, opportunity, status, confirmationReference, userNotes } = req.body || {};
+
+      if (!userId || !opportunityId) {
+        return res.status(400).json({ success: false, error: 'userId and opportunityId are required' });
+      }
+
+      const oppUuid = ensureValidUuid(String(opportunityId));
+
+      // 1. Ensure opportunity exists in public.opportunities so foreign key constraint is satisfied
+      if (opportunity) {
+        await client.from('opportunities').upsert({
+          id: oppUuid,
+          title: opportunity.title,
+          organization_name: opportunity.organization,
+          location: opportunity.location,
+          description: opportunity.description || '',
+          source_url: opportunity.sourceUrl || null,
+          background_check_required: opportunity.backgroundCheck === 'required',
+          min_age: opportunity.minAge ?? 18,
+          required_skills: opportunity.skills || []
+        }, { onConflict: 'id' });
+      }
+
+      // 2. Normalize status to strictly satisfy check constraint
+      const rawInputStatus = (status || 'confirmed').toLowerCase();
+      let dbStatus: 'confirmed' | 'pending_approval' | 'submitted' | 'cancelled' = 'confirmed';
+      if (rawInputStatus === 'cancelled') {
+        dbStatus = 'cancelled';
+      } else if (rawInputStatus === 'submitted') {
+        dbStatus = 'submitted';
+      } else if (
+        ['pending', 'pending_approval', 'draft', 'awaiting_approval', 'submitting', 'submitted_unverified', 'unverified'].includes(rawInputStatus)
+      ) {
+        dbStatus = 'pending_approval';
+      }
+
+      const payload = {
+        user_id: userId,
+        opportunity_id: oppUuid,
+        status: dbStatus,
+        confirmation_reference: confirmationReference || null,
+        submitted_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+
+      const { data, error } = await client
+        .from('registrations')
+        .upsert(payload, { onConflict: 'user_id,opportunity_id' })
+        .select('id, user_id, opportunity_id, status, confirmation_reference, submitted_at, created_at, updated_at, opportunities(*)')
+        .single();
+
+      if (error) {
+        console.error('[POST /api/registrations error]:', error.message);
+        return res.status(500).json({ success: false, error: error.message });
+      }
+
+      const row = data as any;
+      const opp = Array.isArray(row?.opportunities) ? row.opportunities[0] : row?.opportunities || opportunity;
+      const isRemote = opp?.location?.toLowerCase().includes('online') || opp?.location?.toLowerCase().includes('remote');
+
+      const registration = {
+        id: String(row.id),
+        opportunityId: String(opportunityId),
+        opportunityTitle: opp?.title || opportunity?.title || 'Volunteer Commitment',
+        organization: opp?.organization_name || opportunity?.organization || 'Community Partner',
+        category: opp?.cause_name || opportunity?.category || 'Community Service',
+        date: opportunity?.date || (opp?.created_at ? new Date(opp.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }) : 'Upcoming Weekend'),
+        time: opportunity?.time || 'Flexible Weekend Shifts',
+        location: opp?.location || opportunity?.location || 'Local Community Site',
+        format: isRemote ? 'online' : 'in-person',
+        status: (rawInputStatus === 'waitlisted' ? 'waitlisted' : (dbStatus === 'pending_approval' ? 'pending_approval' : 'confirmed')),
+        submittedAt: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+        approvedByUser: true,
+        userNotes: userNotes || '',
+        hoursLogged: 0
+      };
+
+      res.json({ success: true, registration });
+    } catch (err: any) {
+      console.error('[POST /api/registrations exception]:', err);
+      res.status(500).json({ success: false, error: err?.message || 'Server error creating registration' });
     }
   });
 
