@@ -18,6 +18,7 @@ import {
   searchPublicOpportunities
 } from './playwrightService.js';
 import { isBrowserbaseConfigured } from './browserbaseAgent.js';
+import { ensureValidUuid } from '../lib/uuidHelper.js';
 
 // In-memory application storage with Supabase database synchronization
 const applicationsStore = new Map<string, ApplicationRecord>();
@@ -570,17 +571,31 @@ export async function executeApplicationWorkflow(
     // Persist to Supabase registrations table
     try {
       const supabase = getSupabaseServerClient();
-      const { error: dbErr } = await supabase.from('registrations').insert({
+      const oppUuid = ensureValidUuid(application.eventId);
+
+      // Ensure opportunity row exists for foreign key constraint
+      await supabase.from('opportunities').upsert({
+        id: oppUuid,
+        title: application.eventTitle,
+        organization_name: application.organization,
+        source_url: application.destinationUrl
+      }, { onConflict: 'id' });
+
+      const regStatus = result.status === 'verified' ? 'confirmed' : result.status;
+      const { error: dbErr } = await supabase.from('registrations').upsert({
         user_id: userId,
-        opportunity_id: application.eventId,
-        status: result.status === 'verified' ? 'confirmed' : result.status,
-        submitted_at: new Date().toISOString()
-      });
+        opportunity_id: oppUuid,
+        status: regStatus,
+        confirmation_reference: result.confirmationReference || null,
+        submitted_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id,opportunity_id' });
+
       if (dbErr) {
-        console.warn('[ApplicationWorkflow] Database registration insertion notice:', dbErr.message);
+        console.error('[ApplicationWorkflow] Database registration insertion error:', dbErr.message);
       }
     } catch (dbErr: any) {
-      console.warn('[ApplicationWorkflow] Database registration insertion exception:', dbErr?.message);
+      console.error('[ApplicationWorkflow] Database registration insertion exception:', dbErr?.message);
     }
 
     return {
