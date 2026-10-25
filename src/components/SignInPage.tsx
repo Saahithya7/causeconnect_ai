@@ -216,6 +216,48 @@ export const SignInPage: React.FC<SignInPageProps> = ({
     }
   };
 
+  const handleQuickDemoLogin = async (demoEmail: string, demoPass: string) => {
+    setIsLoading(true);
+    setErrorMessage(null);
+    setInfoMessage(null);
+
+    if (supabase && isSupabaseConfigured()) {
+      try {
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email: demoEmail,
+          password: demoPass
+        });
+
+        if (error) {
+          setErrorMessage(error.message);
+          setIsLoading(false);
+          return;
+        }
+
+        if (data.user && data.session) {
+          let userProfileFromDb: VolunteerProfile | null = null;
+          try {
+            const profileRes = await getProfile(data.user.id);
+            userProfileFromDb = profileRes.profile;
+          } catch {}
+
+          const activeProfile: VolunteerProfile = userProfileFromDb || {
+            ...currentUser,
+            name: 'Saahithya',
+            email: demoEmail
+          };
+
+          setIsLoading(false);
+          onSignInSuccess(activeProfile, data.user.id);
+          return;
+        }
+      } catch (err: any) {
+        setErrorMessage(err?.message || 'Quick login encountered an error');
+        setIsLoading(false);
+      }
+    }
+  };
+
   const handleResetPassword = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!resetEmail) return;
@@ -444,6 +486,22 @@ export const SignInPage: React.FC<SignInPageProps> = ({
                     {isSignUp ? 'Sign in instead' : 'Create an account'}
                   </button>
                 </p>
+              </div>
+
+              {/* Quick Demo Volunteer Access */}
+              <div className="mt-4 pt-4 border-t border-[#D5E0D7] text-center">
+                <p className="text-[11px] font-bold text-[#59665C] mb-2 uppercase tracking-wider">
+                  Instant Demo Access (Pre-Configured)
+                </p>
+                <button
+                  type="button"
+                  onClick={() => handleQuickDemoLogin('saahithya2004@gmail.com', 'Password123!')}
+                  disabled={isLoading}
+                  className="w-full py-2.5 px-4 rounded-xl bg-white hover:bg-[#DFEAE1] text-[#244C3A] border border-[#244C3A]/30 text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer shadow-2xs"
+                >
+                  <Sparkles className="w-3.5 h-3.5 text-[#315D48]" />
+                  <span>One-Click Sign In as saahithya2004@gmail.com</span>
+                </button>
               </div>
             </div>
 
