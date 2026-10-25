@@ -658,9 +658,15 @@ export async function createSupabaseRegistration(
       }, { onConflict: 'id' });
 
       if (oppErr) {
-        console.warn('[createSupabaseRegistration] Opportunity upsert notice:', oppErr.message);
-      }
-    }
+        console.error(
+          '[createSupabaseRegistration] Opportunity upsert failed:',
+          oppErr.message
+        );
+        return {
+          success: false,
+          error: `Could not save the opportunity: ${oppErr.message}`,
+  };
+}
 
     // 2. Persist to public.registrations
     // Strictly map status to valid values under registrations_status_check constraint
