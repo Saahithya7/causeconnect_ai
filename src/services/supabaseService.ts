@@ -439,20 +439,77 @@ export async function getUserRegistrations(
   error: string | null;
   tableExists: boolean;
 }> {
-  // 1. In browser runtime without explicit client override, fetch via backend API with service-role permissions
+ 
+  // 1. Browser runtime: persist through the authenticated backend API.
   if (!clientOverride && typeof window !== 'undefined') {
+    if (!supabase || !isSupabaseConfigured()) {
+      return {
+        success: false,
+        error: 'Supabase client is not configured',
+      };
+    }
+
     try {
-      const resp = await fetch(`${API_BASE_URL}/api/registrations?userId=${encodeURIComponent(userId)}`);
-      if (resp.ok) {
-        const json = await resp.json();
-        if (json.success && Array.isArray(json.registrations)) {
-          return { registrations: json.registrations, error: null, tableExists: true };
-        }
+      const {
+        data: { session },
+        error: sessionError,
+      } = await supabase.auth.getSession();
+
+      if (sessionError || !session?.access_token) {
+        return {
+          success: false,
+          error: 'Please sign in again before registering.',
+        };
       }
-    } catch {
-      // Fall through to direct client query
+
+      const resp = await fetch(`${API_BASE_URL}/api/registrations`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          userId,
+          opportunityId,
+          opportunity: details?.opportunity,
+          status: details?.status,
+          confirmationReference: details?.confirmationReference,
+          userNotes: details?.userNotes,
+        }),
+      });
+
+      const json = await resp.json().catch(() => null);
+
+      if (!resp.ok) {
+        return {
+          success: false,
+          error: json?.error || `Registration request failed (${resp.status}).`,
+        };
+      }
+
+      if (!json?.success || !json?.registration) {
+        return {
+          success: false,
+          error: json?.error || 'Backend did not confirm registration persistence.',
+        };
+      }
+
+      return {
+        success: true,
+        id: json.registration.id,
+        registration: json.registration,
+        error: null,
+      };
+    } catch (e: any) {
+      console.error('[createSupabaseRegistration] Backend request failed:', e);
+
+      return {
+        success: false,
+        error: e?.message || 'Could not reach the registration service.',
+      };
     }
   }
+
 
   // 2. Direct client query (used in Node test runners or offline)
   const activeClient = clientOverride || supabase;
