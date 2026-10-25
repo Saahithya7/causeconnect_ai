@@ -313,16 +313,35 @@ export default function App() {
   // Real Database Registration Actions
   const handleConfirmRegistration = async (
     opp: Opportunity,
-    userNotes: string
+    userNotes: string,
+    options?: {
+      status?: string;
+      confirmationReference?: string;
+    }
   ): Promise<{ success: boolean; error: string | null; registration?: Registration }> => {
-    if (!supabaseUserId) {
+    let activeUserId = supabaseUserId;
+    if (!activeUserId && supabase && isSupabaseConfigured()) {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (sessionData?.session?.user) {
+        activeUserId = sessionData.session.user.id;
+        setSupabaseUserId(activeUserId);
+      }
+    }
+
+    if (!activeUserId) {
       return {
         success: false,
         error: 'You must be signed in to submit an approved registration. Please sign in to your volunteer account.'
       };
     }
 
-    const res = await createSupabaseRegistration(supabaseUserId, opp.id);
+    const res = await createSupabaseRegistration(activeUserId, opp.id, {
+      opportunity: opp,
+      status: options?.status || 'confirmed',
+      confirmationReference: options?.confirmationReference,
+      userNotes
+    });
+
     if (!res.success) {
       return {
         success: false,
@@ -331,9 +350,14 @@ export default function App() {
     }
 
     // Refresh registrations from database
-    const regResult = await getUserRegistrations(supabaseUserId);
-    if (regResult.registrations) {
+    const regResult = await getUserRegistrations(activeUserId);
+    if (regResult.registrations && regResult.registrations.length > 0) {
       setRegistrations(regResult.registrations);
+    } else if (res.registration) {
+      setRegistrations((prev) => [
+        res.registration!,
+        ...prev.filter((r) => r.opportunityId !== res.registration!.opportunityId && r.id !== res.registration!.id)
+      ]);
     }
 
     // Record agent audit run in database
@@ -343,7 +367,7 @@ export default function App() {
       {
         opportunity_id: opp.id,
         opportunity_title: opp.title,
-        action: 'Volunteer Approval Verified',
+        action: 'Volunteer Approval Verified & Persisted',
         organization: opp.organization
       }
     );
@@ -354,29 +378,43 @@ export default function App() {
       setAgentLogs(agentResult.logs);
     }
 
-    const created = regResult.registrations.find((r) => r.opportunityId === opp.id) || {
-      id: res.id || `reg-${Date.now()}`,
-      opportunityId: opp.id,
-      opportunityTitle: opp.title,
-      organization: opp.organization,
-      category: opp.category,
-      date: opp.date,
-      time: opp.time,
-      location: opp.location,
-      format: opp.format,
-      status: 'pending_approval',
-      submittedAt: new Date().toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric'
-      }),
-      approvedByUser: true,
-      userNotes: userNotes.trim() || undefined,
-      hoursLogged: 0
-    };
+    const finalReg = res.registration || regResult.registrations?.find((r) => r.opportunityId === opp.id || r.opportunityTitle === opp.title);
 
-    return { success: true, registration: created, error: null };
+    if (finalReg) {
+      setRegistrations((prev) => [
+        finalReg,
+        ...prev.filter((r) => r.opportunityId !== finalReg.opportunityId && r.id !== finalReg.id)
+      ]);
+    }
+
+    return { success: true, registration: finalReg, error: null };
   };
+
+  const handleRefreshRegistrations = useCallback(async () => {
+    let activeId = supabaseUserId;
+    if (!activeId && supabase && isSupabaseConfigured()) {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (sessionData?.session?.user) {
+        activeId = sessionData.session.user.id;
+        setSupabaseUserId(activeId);
+      }
+    }
+    if (!activeId) return;
+    try {
+      const regResult = await getUserRegistrations(activeId);
+      if (regResult.registrations) {
+        setRegistrations(regResult.registrations);
+      }
+    } catch (e) {
+      console.warn('Error refreshing registrations:', e);
+    }
+  }, [supabaseUserId]);
+
+  useEffect(() => {
+    if (currentDashboardView === 'registered') {
+      handleRefreshRegistrations();
+    }
+  }, [currentDashboardView, handleRefreshRegistrations]);
 
   const handleCancelRegistration = async (regId: string) => {
     if (!supabaseUserId) return;
@@ -699,6 +737,7 @@ export default function App() {
               onCancelRegistration={handleCancelRegistration}
               onLogHours={handleLogHours}
               onGoToDiscover={() => setCurrentDashboardView('discover')}
+              onRefresh={handleRefreshRegistrations}
             />
           )}
 
@@ -752,6 +791,11 @@ export default function App() {
         onClose={() => setRegistrationModalOpp(null)}
         onConfirmRegistration={handleConfirmRegistration}
         onGoToRegisteredEvents={() => setCurrentDashboardView('registered')}
+        onPromptSignIn={() => {
+          setRegistrationModalOpp(null);
+          setAppMode('signin');
+        }}
+        isAuthenticated={Boolean(supabaseUserId)}
       />
 
       {/* Create / Publish Opportunity Modal */}
