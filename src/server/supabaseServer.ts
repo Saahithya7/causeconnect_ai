@@ -6,16 +6,38 @@ import path from 'path';
 dotenv.config();
 dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 
-const SUPABASE_URL =
-  process.env.SUPABASE_URL ||
-  process.env.VITE_SUPABASE_URL ||
-  'https://sgndetrsmhlkelqjsumz.supabase.co';
+const DEFAULT_SUPABASE_URL = 'https://sgndetrsmhlkelqjsumz.supabase.co';
+const DEFAULT_SUPABASE_KEY = 'sb_publishable_tmYz69ggBOYLpW9zTsQvEA_ZRxNrcWD';
 
-const SUPABASE_KEY =
-  process.env.SUPABASE_SERVICE_ROLE_KEY ||
-  process.env.SUPABASE_ANON_KEY ||
-  process.env.VITE_SUPABASE_ANON_KEY ||
-  'sb_publishable_tmYz69ggBOYLpW9zTsQvEA_ZRxNrcWD';
+function isValidSupabaseUrl(val?: string | null): boolean {
+  if (!val || typeof val !== 'string') return false;
+  const trimmed = val.trim();
+  return (trimmed.startsWith('https://') || trimmed.startsWith('http://')) && trimmed.includes('.supabase.co');
+}
+
+function resolveServerUrl(): string {
+  if (isValidSupabaseUrl(process.env.SUPABASE_URL)) return process.env.SUPABASE_URL!.trim();
+  if (isValidSupabaseUrl(process.env.VITE_SUPABASE_URL)) return process.env.VITE_SUPABASE_URL!.trim();
+  return DEFAULT_SUPABASE_URL;
+}
+
+function resolveServerKey(): string {
+  const candidates = [
+    process.env.SUPABASE_SERVICE_ROLE_KEY,
+    process.env.VITE_SUPABASE_ANON_KEY,
+    process.env.SUPABASE_ANON_KEY,
+    DEFAULT_SUPABASE_KEY
+  ];
+  for (const c of candidates) {
+    if (c && typeof c === 'string' && c.trim().length >= 20 && !c.trim().startsWith('http')) {
+      return c.trim();
+    }
+  }
+  return DEFAULT_SUPABASE_KEY;
+}
+
+const SUPABASE_URL = resolveServerUrl();
+const SUPABASE_KEY = resolveServerKey();
 
 let supabaseServerClient: SupabaseClient | null = null;
 
