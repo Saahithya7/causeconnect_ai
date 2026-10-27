@@ -16,23 +16,32 @@ function isValidSupabaseUrl(val?: string | null): boolean {
 }
 
 function resolveServerUrl(): string {
+  if (isValidSupabaseUrl(process.env.NEXT_PUBLIC_SUPABASE_URL)) return process.env.NEXT_PUBLIC_SUPABASE_URL!.trim();
   if (isValidSupabaseUrl(process.env.SUPABASE_URL)) return process.env.SUPABASE_URL!.trim();
   if (isValidSupabaseUrl(process.env.VITE_SUPABASE_URL)) return process.env.VITE_SUPABASE_URL!.trim();
   return DEFAULT_SUPABASE_URL;
 }
 
 function resolveServerKey(): string {
-  const candidates = [
-    process.env.SUPABASE_SERVICE_ROLE_KEY,
-    process.env.VITE_SUPABASE_ANON_KEY,
-    process.env.SUPABASE_ANON_KEY,
+  // If SUPABASE_SERVICE_ROLE_KEY is provided and not a placeholder
+  const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
+  if (serviceKey && serviceKey.length >= 20 && !serviceKey.includes('your_supabase')) {
+    return serviceKey;
+  }
+
+  // Verified publishable key candidates
+  const pubCandidates = [
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
     DEFAULT_SUPABASE_KEY
   ];
-  for (const c of candidates) {
+
+  for (const c of pubCandidates) {
     if (c && typeof c === 'string' && c.trim().length >= 20 && !c.trim().startsWith('http')) {
       return c.trim();
     }
   }
+
   return DEFAULT_SUPABASE_KEY;
 }
 
@@ -51,6 +60,20 @@ export function getSupabaseServerClient(): SupabaseClient {
     });
   }
   return supabaseServerClient;
+}
+
+export function createUserSupabaseClient(token: string): SupabaseClient {
+  return createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
+    },
+    global: {
+      headers: {
+        Authorization: `Bearer ${token}`
+      }
+    }
+  });
 }
 
 export interface AuthenticatedUser {
