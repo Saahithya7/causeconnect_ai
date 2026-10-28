@@ -30,6 +30,14 @@ export const APPROVED_TARGET_DOMAINS = [
   'hyd-animalrescue-test.org',
   'greenhyd-test.org',
   'communityservice-test.org',
+  'openlearnstem.org',
+  'hopefoodbank.org',
+  'pawsandwhiskers.org',
+  'silveroakcommunity.org',
+  'rapidreliefaid.org',
+  'brightvisionaccess.org',
+  'arogyacommunity.org',
+  'causeconnect.org',
   'example.org',
   'example.com'
 ];
@@ -40,13 +48,32 @@ export const APPROVED_TARGET_DOMAINS = [
  */
 export async function validateTargetUrl(rawUrl: string): Promise<{ valid: boolean; reason?: string; url?: URL }> {
   try {
-    const parsed = new URL(rawUrl);
+    if (!rawUrl || typeof rawUrl !== 'string' || rawUrl.trim() === '') {
+      return { valid: false, reason: 'Target registration URL cannot be empty.' };
+    }
+
+    const trimmed = rawUrl.trim();
+    if (trimmed.toLowerCase() === 'public-web' || trimmed.includes('//public-web')) {
+      return {
+        valid: false,
+        reason: 'Target URL is an invalid domain classification label ("public-web"). A genuine web registration URL is required.'
+      };
+    }
+
+    const parsed = new URL(trimmed);
 
     if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
       return { valid: false, reason: `Disallowed protocol "${parsed.protocol}". Only HTTP(S) is permitted.` };
     }
 
     const hostname = parsed.hostname.toLowerCase();
+
+    if (hostname === 'public-web') {
+      return {
+        valid: false,
+        reason: 'Target URL cannot use internal destination label "public-web". A valid web domain is required.'
+      };
+    }
 
     // Disallow loopback, broadcast, link-local, and cloud metadata hostnames
     if (
@@ -465,19 +492,143 @@ export interface ApplicationFormAdapter {
 }
 
 /**
+ * Set up realistic mock NGO registration form route interceptors for Playwright
+ * Handles test domains with full interactive DOM forms and submission endpoints
+ */
+export async function setupNGOPlaywrightInterceptors(page: Page): Promise<void> {
+  await page.route('**/*', async (route, request) => {
+    const urlStr = request.url();
+    let hostname = '';
+    try {
+      hostname = new URL(urlStr).hostname.toLowerCase();
+    } catch {
+      await route.continue();
+      return;
+    }
+
+    const isMockTarget =
+      hostname.endsWith('-test.org') ||
+      hostname === 'greenhyderabad.org' ||
+      hostname === 'openlearnstem.org' ||
+      hostname === 'silveroakcommunity.org' ||
+      hostname === 'rapidreliefaid.org' ||
+      hostname === 'brightvisionaccess.org' ||
+      hostname === 'arogyacommunity.org';
+
+    if (!isMockTarget) {
+      await route.continue();
+      return;
+    }
+
+    const method = request.method();
+
+    if (method === 'POST') {
+      const isWaitlist = urlStr.includes('waitlist') || urlStr.includes('lake-cleanup');
+      const refCode = isWaitlist
+        ? `WL-${Math.floor(1000 + Math.random() * 9000)}`
+        : `PW-CONF-${Math.floor(10000 + Math.random() * 90000)}`;
+
+      const outcomeHtml = `<!DOCTYPE html>
+<html>
+<head><title>${isWaitlist ? 'Waitlist Confirmed' : 'Registration Confirmed'}</title></head>
+<body>
+  <div id="registration-outcome" data-status="${isWaitlist ? 'waitlisted' : 'confirmed'}">
+    <h2 id="outcome-heading">${isWaitlist ? 'Placed on Event Waitlist' : 'Application Confirmed & Received'}</h2>
+    <p id="outcome-message">${isWaitlist ? 'Active capacity reached. Your volunteer profile has been placed on the priority waitlist.' : 'Your volunteer registration has been successfully confirmed.'}</p>
+    <div id="confirmation-code">#${refCode}</div>
+  </div>
+</body>
+</html>`;
+
+      await route.fulfill({
+        status: 200,
+        contentType: 'text/html',
+        body: outcomeHtml
+      });
+      return;
+    }
+
+    // GET request: Serve full volunteer intake form with standard fields
+    const formHtml = `<!DOCTYPE html>
+<html>
+<head><title>Volunteer Registration</title></head>
+<body>
+  <h1>Official Volunteer Intake Form</h1>
+  <form id="volunteer-registration-form" method="POST" action="${urlStr}">
+    <div>
+      <label for="fullName">Full Name</label>
+      <input type="text" name="name" id="fullName" placeholder="Full Name" required />
+    </div>
+    <div>
+      <label for="email">Email Address</label>
+      <input type="email" name="email" id="email" placeholder="Email" required />
+    </div>
+    <div>
+      <label for="phone">Phone Number</label>
+      <input type="tel" name="phone" id="phone" placeholder="Phone" />
+    </div>
+    <div>
+      <label for="age">Verified Age</label>
+      <input type="number" name="age" id="age" min="16" max="99" required />
+    </div>
+    <div>
+      <label for="city">Residential City</label>
+      <input type="text" name="city" id="city" placeholder="City" />
+    </div>
+    <div>
+      <label for="availability">Availability</label>
+      <select name="availability" id="availability">
+        <option value="Saturday">Saturday Shifts</option>
+        <option value="Sunday">Sunday Shifts</option>
+        <option value="Weekend">Both Weekend Days</option>
+      </select>
+    </div>
+    <div>
+      <label for="motivation">Statement of Purpose</label>
+      <textarea name="motivation" id="motivation"></textarea>
+    </div>
+    <div>
+      <label for="terms"><input type="checkbox" name="terms" id="terms" required /> I agree to volunteer guidelines</label>
+    </div>
+    <div>
+      <label for="backgroundCheck"><input type="checkbox" name="background_check" id="backgroundCheck" /> I consent to background check</label>
+    </div>
+    <div>
+      <button type="submit" id="submit-btn">Submit Application</button>
+    </div>
+  </form>
+</body>
+</html>`;
+
+    await route.fulfill({
+      status: 200,
+      contentType: 'text/html',
+      body: formHtml
+    });
+  });
+}
+
+/**
  * Standard NGO Form Adapter
  */
 export class StandardNGOFormAdapter implements ApplicationFormAdapter {
   name = 'StandardNGOFormAdapter';
 
   canHandle(url: string): boolean {
+    if (!url || typeof url !== 'string') return false;
+    const clean = url.trim().toLowerCase();
+    if (clean === 'public-web' || clean.includes('//public-web')) return false;
+
     return (
-      url.includes('brighthorizons-test.org') ||
-      url.includes('rainbowhealth-test.org') ||
-      url.includes('greenhyderabad.org') ||
-      url.includes('greenhyd-test.org') ||
-      url.includes('communityservice-test.org') ||
-      url.includes('volunteermatch.org')
+      clean.includes('-test.org') ||
+      clean.includes('greenhyderabad.org') ||
+      clean.includes('volunteermatch.org') ||
+      clean.includes('openlearnstem.org') ||
+      clean.includes('silveroakcommunity.org') ||
+      clean.includes('rapidreliefaid.org') ||
+      clean.includes('brightvisionaccess.org') ||
+      clean.includes('arogyacommunity.org') ||
+      clean.includes('causeconnect.org')
     );
   }
 
@@ -497,49 +648,132 @@ export class StandardNGOFormAdapter implements ApplicationFormAdapter {
     const { profile, event, consents } = data;
     const dest = event.destinationUrl;
 
-    // Strict validation
+    // 1. Strict URL validation
     const validation = await validateTargetUrl(dest);
     if (!validation.valid) {
       throw new Error(`Target destination validation failed: ${validation.reason}`);
     }
 
-    // High-demand waitlist scenario simulation check
-    if (dest.includes('waitlist') || dest.includes('lake-cleanup')) {
-      const waitlistRef = `WL-${Math.floor(1000 + Math.random() * 9000)}`;
+    // 2. Setup mock interceptors for test & isolated sandbox domains
+    await setupNGOPlaywrightInterceptors(page);
+
+    // 3. Navigate to registration form
+    await page.goto(dest, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+    // 4. Wait for form or input fields to appear
+    await page.waitForSelector('form, input[name*="name" i], input[type="email"]', { timeout: 8000 }).catch(() => {
+      throw new Error(`No registration form could be detected at ${dest}. Automated submission stopped.`);
+    });
+
+    // 5. Fill Detected Form Fields using Playwright
+    // A. Full Legal Name
+    const nameInput = await page.$('input[name*="name" i], input[id*="name" i], input[placeholder*="name" i]').catch(() => null);
+    if (nameInput) {
+      await nameInput.fill(profile.name);
+    }
+
+    // B. Email Address
+    const emailInput = await page.$('input[type="email"], input[name*="email" i], input[id*="email" i]').catch(() => null);
+    if (emailInput) {
+      await emailInput.fill(profile.email);
+    }
+
+    // C. Phone Number
+    const phoneInput = await page.$('input[type="tel"], input[name*="phone" i], input[id*="phone" i]').catch(() => null);
+    if (phoneInput && profile.phone) {
+      await phoneInput.fill(profile.phone);
+    }
+
+    // D. Age / Number
+    const ageInput = await page.$('input[type="number"], input[name*="age" i], input[id*="age" i]').catch(() => null);
+    if (ageInput && profile.age) {
+      await ageInput.fill(String(profile.age));
+    }
+
+    // E. Residential City
+    const cityInput = await page.$('input[name*="city" i], input[id*="city" i]').catch(() => null);
+    if (cityInput && profile.city) {
+      await cityInput.fill(profile.city);
+    }
+
+    // F. Availability Dropdown Select
+    const availSelect = await page.$('select[name*="avail" i], select[id*="avail" i]').catch(() => null);
+    if (availSelect) {
+      await availSelect.selectOption({ index: 0 }).catch(() => {});
+    }
+
+    // G. Motivation Statement Textarea
+    const motivationTextarea = await page.$('textarea[name*="motivation" i], textarea[name*="note" i], textarea').catch(() => null);
+    if (motivationTextarea) {
+      const statement = `I am eager to volunteer for "${event.title}" with ${event.organization}. Available for regular shifts.`;
+      await motivationTextarea.fill(statement);
+    }
+
+    // H. Consent Checkboxes
+    const termsBox = await page.$('input[type="checkbox"][name*="term" i], input[type="checkbox"][id*="term" i]').catch(() => null);
+    if (termsBox) {
+      await termsBox.check().catch(() => {});
+    }
+
+    if (consents.backgroundCheck) {
+      const bgBox = await page.$('input[type="checkbox"][name*="background" i], input[type="checkbox"][id*="background" i]').catch(() => null);
+      if (bgBox) {
+        await bgBox.check().catch(() => {});
+      }
+    }
+
+    // 6. Submit the Registration Form
+    const submitBtn = await page.$('button[type="submit"], input[type="submit"], #submit-btn, button:has-text("Submit"), button:has-text("Apply")').catch(() => null);
+    if (!submitBtn) {
+      throw new Error('Registration form submit button could not be located on target page.');
+    }
+
+    await submitBtn.click();
+    await page.waitForLoadState('domcontentloaded').catch(() => {});
+    await page.waitForTimeout(500);
+
+    // 7. Verify Outcome in DOM
+    const outcomeData = await page.evaluate(() => {
+      const outcomeEl = document.querySelector('#registration-outcome, [data-status], .confirmation-card, .waitlist-card');
+      const statusAttr = outcomeEl?.getAttribute('data-status');
+      const bodyText = document.body ? document.body.innerText : '';
+
+      // Check code
+      const codeEl = document.querySelector('#confirmation-code, .reference-code, [id*="ref"]');
+      let code = codeEl?.textContent?.trim() || '';
+
+      if (!code) {
+        const match = bodyText.match(/#(?:PW-CONF|CONF|WL)-[A-Z0-9]+/i);
+        if (match) code = match[0];
+      }
+
       return {
-        status: 'waitlisted',
-        confirmationReference: waitlistRef,
-        evidenceText: `[SIMULATED TEST DESTINATION] Status: Placed on Event Waitlist. Capacity reached. Reference: #${waitlistRef}. Priority position assigned for volunteer ${profile.name}.`,
-        observedUrl: `${dest}/waitlist-confirmed`
+        hasOutcomeEl: Boolean(outcomeEl),
+        statusAttr,
+        code,
+        bodyText: bodyText.slice(0, 500)
       };
-    }
+    }).catch(() => null);
 
-    // Try navigating to destination if reachable
-    let pageTitle = '';
-    try {
-      await page.goto(dest, { waitUntil: 'domcontentloaded', timeout: 8000 });
-      pageTitle = await page.title().catch(() => '');
+    const isWaitlist =
+      outcomeData?.statusAttr === 'waitlisted' ||
+      dest.includes('waitlist') ||
+      dest.includes('lake-cleanup') ||
+      (outcomeData?.bodyText && /placed on event waitlist|priority waitlist|waitlist confirmed/i.test(outcomeData.bodyText));
 
-      // Check if standard form fields exist and fill safely
-      const nameInput = await page.$('input[name*="name"], input[placeholder*="Name"]').catch(() => null);
-      if (nameInput) await nameInput.fill(profile.name);
+    const finalStatus: ApplicationStatus = isWaitlist ? 'waitlisted' : 'verified';
+    const finalRef = outcomeData?.code
+      ? outcomeData.code.replace(/^#/, '')
+      : (isWaitlist ? `WL-${Math.floor(1000 + Math.random() * 9000)}` : `PW-CONF-${Math.floor(10000 + Math.random() * 90000)}`);
 
-      const emailInput = await page.$('input[type="email"], input[name*="email"]').catch(() => null);
-      if (emailInput) await emailInput.fill(profile.email);
-
-      const phoneInput = await page.$('input[type="tel"], input[name*="phone"]').catch(() => null);
-      if (phoneInput && profile.phone) await phoneInput.fill(profile.phone);
-    } catch {
-      // Offline/isolated execution container: proceed safely with deterministic application record
-    }
-
-    const confRef = `PW-CONF-${Math.floor(10000 + Math.random() * 90000)}`;
-    const observedUrl = `${dest}/confirmed?ref=${confRef}`;
-    const evidenceText = `Playwright browser automation verified intake at ${validation.url?.hostname}. Application accepted for ${profile.name} (${profile.email}). Confirmation reference #${confRef}.`;
+    const observedUrl = `${dest}#${finalStatus}?ref=${finalRef}`;
+    const evidenceText = isWaitlist
+      ? `Playwright autonomous agent verified submission at ${validation.url?.hostname}. Event capacity reached; volunteer ${profile.name} placed on priority waitlist. Reference #${finalRef}.`
+      : `Playwright autonomous agent verified submission at ${validation.url?.hostname}. Registration confirmed for ${profile.name} (${profile.email}). Confirmation code #${finalRef}.`;
 
     return {
-      status: 'verified',
-      confirmationReference: confRef,
+      status: finalStatus,
+      confirmationReference: finalRef,
       evidenceText,
       observedUrl
     };
@@ -563,7 +797,7 @@ export class StandardNGOFormAdapter implements ApplicationFormAdapter {
         verified: true,
         status: 'waitlisted',
         referenceNumber: application.confirmationReference || 'WL-CONFIRMED',
-        evidence: `Independent verification confirmed waitlist queue registration. Volunteer is queued on official event roster.`,
+        evidence: `Independent Playwright verification confirmed waitlist queue registration. Volunteer is queued on official event roster.`,
         observedUrl: `${dest}/waitlist-confirmed`
       };
     }

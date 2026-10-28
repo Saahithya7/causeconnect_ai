@@ -23,9 +23,9 @@ function resolveServerUrl(): string {
 }
 
 function resolveServerKey(): string {
-  // If SUPABASE_SERVICE_ROLE_KEY is provided and not a placeholder
+  // If SUPABASE_SERVICE_ROLE_KEY is provided and not a placeholder or URL
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
-  if (serviceKey && serviceKey.length >= 20 && !serviceKey.includes('your_supabase')) {
+  if (serviceKey && serviceKey.length >= 20 && !serviceKey.includes('your_supabase') && !serviceKey.startsWith('http')) {
     return serviceKey;
   }
 
@@ -45,6 +45,13 @@ function resolveServerKey(): string {
   return DEFAULT_SUPABASE_KEY;
 }
 
+import WebSocket from 'ws';
+
+// Ensure WebSocket is globally accessible in Node.js runtime for Supabase Realtime
+if (typeof globalThis !== 'undefined' && typeof (globalThis as any).WebSocket === 'undefined') {
+  (globalThis as any).WebSocket = WebSocket;
+}
+
 const SUPABASE_URL = resolveServerUrl();
 const SUPABASE_KEY = resolveServerKey();
 
@@ -56,6 +63,9 @@ export function getSupabaseServerClient(): SupabaseClient {
       auth: {
         autoRefreshToken: false,
         persistSession: false
+      },
+      realtime: {
+        transport: WebSocket as any
       }
     });
   }
@@ -72,6 +82,9 @@ export function createUserSupabaseClient(token: string): SupabaseClient {
       headers: {
         Authorization: `Bearer ${token}`
       }
+    },
+    realtime: {
+      transport: WebSocket as any
     }
   });
 }

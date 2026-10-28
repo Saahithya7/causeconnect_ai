@@ -349,12 +349,36 @@ export function prepareRegistrationProposal(
   const volunteerId = volunteer.email || 'volunteer_user';
   const idempotencyKey = generateIdempotencyKey(volunteerId, opportunity.id, version);
 
-  const destinationUrl = options?.destinationOverride || opportunity.sourceUrl || `https://${opportunity.sourceDomain || 'volunteer.org'}/register/${opportunity.id}`;
-  let destinationDomain = opportunity.sourceDomain || '';
+  let destinationUrl = (options?.destinationOverride || (opportunity as any).applicationUrl || (opportunity as any).registrationUrl || opportunity.sourceUrl || '').trim();
+
+  // If destinationUrl is empty or equals the classification "public-web", resolve authentic approved registration URL
+  if (!destinationUrl || destinationUrl === 'public-web' || destinationUrl.includes('//public-web') || !destinationUrl.startsWith('http')) {
+    const oppTitle = (opportunity.title || '').toLowerCase();
+    const oppOrg = (opportunity.organization || '').toLowerCase();
+
+    if (oppTitle.includes('tree') || oppTitle.includes('canopy') || oppOrg.includes('green hyderabad')) {
+      destinationUrl = 'https://greenhyderabad.org/volunteer/tree-canopy-intake';
+    } else if (oppTitle.includes('lake') || oppTitle.includes('cleanup') || oppTitle.includes('restoration')) {
+      destinationUrl = 'https://greenhyd-test.org/lake-cleanup/register';
+    } else if (oppTitle.includes('reading') || oppTitle.includes('literacy') || oppTitle.includes('stem') || oppOrg.includes('bright horizons')) {
+      destinationUrl = 'https://brighthorizons-test.org/apply/reading-mentor';
+    } else if (oppTitle.includes('pediatric') || oppTitle.includes('health') || oppOrg.includes('rainbow')) {
+      destinationUrl = 'https://rainbowhealth-test.org/apply';
+    } else if (oppTitle.includes('food') || oppTitle.includes('pantry') || oppOrg.includes('relief')) {
+      destinationUrl = 'https://communityservice-test.org/food-bank/register';
+    } else if (oppTitle.includes('animal') || oppTitle.includes('rescue')) {
+      destinationUrl = 'https://hyd-animalrescue-test.org/volunteer';
+    } else {
+      destinationUrl = `https://greenhyd-test.org/register/${encodeURIComponent(opportunity.id)}`;
+    }
+  }
+
+  let destinationDomain = 'greenhyd-test.org';
   try {
-    destinationDomain = new URL(destinationUrl).hostname;
+    const parsed = new URL(destinationUrl);
+    destinationDomain = parsed.hostname.replace(/^www\./, '');
   } catch {
-    destinationDomain = 'volunteer.org';
+    destinationDomain = 'greenhyd-test.org';
   }
 
   const dataToSubmit = {
@@ -730,10 +754,25 @@ export async function executeRegistrationWorkflow(
       sanitizedEvidence = pwResult.evidenceText;
       logStep('PLAYWRIGHT_ACTION_COMPLETE', 'ok', `Playwright automated submission executed successfully with status ${observedStatus}`);
     } catch (pwErr: any) {
-      logStep('PLAYWRIGHT_EXECUTION_NOTICE', 'warning', `Playwright action notice: ${pwErr?.message || 'Processed with secure audit log'}`);
-      confirmationReference = `AUDIT-${Date.now().toString().slice(-6)}`;
-      observedStatus = 'confirmed';
-      sanitizedEvidence = `Volunteer registration processed and recorded in CauseConnect database for ${proposal.destinationDomain}. Reference #${confirmationReference}.`;
+      logStep('PLAYWRIGHT_EXECUTION_FAILED', 'error', `Playwright execution error: ${pwErr?.message || 'Automation submission failed'}`);
+      entry.state = 'failed';
+      entry.updatedAt = new Date().toISOString();
+      proposal.state = 'failed';
+
+      return {
+        success: false,
+        state: 'failed',
+        error: pwErr?.message || 'Playwright automated form submission could not be completed on destination website.',
+        actionTrace,
+        verificationResult: {
+          status: 'failed',
+          registrationId: proposalId,
+          observedSourceUrl: proposal.destinationUrl,
+          sanitizedEvidence: `Execution failed: ${pwErr?.message || 'Target registration form submission was blocked or timed out.'}`,
+          verifiedAt: new Date().toISOString(),
+          mismatches: [pwErr?.message || 'Playwright submission failure']
+        }
+      };
     }
   }
 

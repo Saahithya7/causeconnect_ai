@@ -6,6 +6,11 @@
  * 3. Cross-user access isolation (RLS & Ownership check)
  * 4. Handling of unverified / pending registration status
  */
+import WebSocket from 'ws';
+if (typeof globalThis !== 'undefined' && typeof (globalThis as any).WebSocket === 'undefined') {
+  (globalThis as any).WebSocket = WebSocket;
+}
+
 import { createClient } from '@supabase/supabase-js';
 import { ensureValidUuid } from '../src/lib/uuidHelper.js';
 import { createSupabaseRegistration, getUserRegistrations } from '../src/services/supabaseService.js';
@@ -19,8 +24,8 @@ const TEST_USER_B = 'e956d686-74f8-4a91-a54c-24ea9e520bd9';
 
 function createTestAdminClient() {
   const serviceKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim();
-  if (serviceKey && serviceKey.length >= 20 && !serviceKey.includes('your_supabase')) {
-    return createClient(SUPABASE_URL, serviceKey);
+  if (serviceKey && serviceKey.length >= 20 && !serviceKey.includes('your_supabase') && !serviceKey.startsWith('http')) {
+    return createClient(SUPABASE_URL, serviceKey, { realtime: { transport: WebSocket as any } });
   }
 
   // Fallback in-memory mock client for admin service-role operations during automated testing
@@ -123,7 +128,7 @@ async function runTests() {
   console.log('======================================================================\n');
 
   const adminClient = createTestAdminClient();
-  const anonClient = createClient(SUPABASE_URL, ANON_KEY);
+  const anonClient = createClient(SUPABASE_URL, ANON_KEY, { realtime: { transport: WebSocket as any } });
 
   let passed = 0;
   let failed = 0;

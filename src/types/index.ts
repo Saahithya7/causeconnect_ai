@@ -72,6 +72,22 @@ export interface VolunteerProfile {
   preferredFormat: 'all' | 'in-person' | 'online';
   maxDistanceMiles: number;
   bio: string;
+  // CommitMate availability settings
+  timezone?: string;
+  weeklyHoursTarget?: number;
+  preferredWorkingHours?: {
+    start: string;
+    end: string;
+  };
+  timeSlots?: TimeSlot[];
+  googleCalendarConnected?: boolean;
+  googleCalendarEmail?: string;
+  reminderPreferences?: {
+    before24h: boolean;
+    before1h: boolean;
+    browserNotifications: boolean;
+    customMinutes?: number;
+  };
 }
 
 export interface Registration {
@@ -90,6 +106,20 @@ export interface Registration {
   userNotes?: string;
   hoursLogged?: number;
   calendarExported?: boolean;
+  // CommitMate calendar & reminder fields
+  googleCalendarEventId?: string;
+  calendarSyncedAt?: string;
+  remindersEnabled?: boolean;
+  // WaitlistGuardian monitoring fields
+  monitoringEnabled?: boolean;
+  monitoringStatus?: WaitlistMonitoringStatus;
+  availabilityStatus?: WaitlistAvailabilityStatus;
+  lastCheckedAt?: string | null;
+  nextCheckAt?: string | null;
+  checkRetryCount?: number;
+  lastCheckError?: string | null;
+  statusChangeHistory?: WaitlistStatusHistoryEntry[];
+  sourceUrl?: string;
 }
 
 export interface AgentLog {
@@ -373,3 +403,129 @@ export interface OfficialTestRun {
   errorDetails?: string | null;
   actionTrace: ActionTraceStep[];
 }
+
+// -------------------------------------------------------------------
+// CommitMate — Availability, Schedule Conflict & Reminder Agent Types
+// -------------------------------------------------------------------
+
+export interface TimeSlot {
+  id?: string;
+  day: 'Monday' | 'Tuesday' | 'Wednesday' | 'Thursday' | 'Friday' | 'Saturday' | 'Sunday' | 'Weekday' | 'Weekend';
+  startTime: string; // "09:00"
+  endTime: string;   // "13:00"
+  label?: string;    // "Morning Shift"
+}
+
+export interface VolunteerAvailability {
+  timezone: string; // e.g. "Asia/Kolkata" or "America/New_York"
+  weeklyHoursTarget: number;
+  availableDays: string[];
+  timeSlots: TimeSlot[];
+  preferredWorkingHours?: {
+    start: string;
+    end: string;
+  };
+  bufferMinutesBetweenEvents?: number;
+}
+
+export interface ScheduleConflict {
+  hasConflict: boolean;
+  isIncomplete: boolean; // True if event time is unspecified/flexible
+  conflictType?: 'overlap' | 'outside_preferred_hours' | 'outside_available_days' | 'insufficient_buffer';
+  severity: 'blocking' | 'warning' | 'info';
+  conflictingEventTitle?: string;
+  conflictingEventTime?: string;
+  conflictingRegistration?: Registration;
+  conflictDescription?: string;
+  incompleteReason?: string;
+  explanation: string;
+  suggestedAction?: string;
+}
+
+export interface GoogleCalendarConnectionStatus {
+  isConnected: boolean;
+  userEmail?: string;
+  scopes?: string[];
+  expiresAt?: number;
+  lastSyncedAt?: string;
+}
+
+export interface CommitMateReminder {
+  id: string;
+  userId: string;
+  registrationId?: string;
+  opportunityId?: string;
+  opportunityTitle: string;
+  reminderType: '24h' | '1h' | 'custom' | 'test';
+  scheduledFor: string;
+  status: 'scheduled' | 'delivered' | 'failed' | 'cancelled';
+  deliveredAt?: string | null;
+  channel: 'in_app' | 'browser' | 'email';
+  message: string;
+  isRead: boolean;
+  createdAt: string;
+}
+
+// -------------------------------------------------------------------
+// WaitlistGuardian — Intelligent Waitlist & Cancellation Agent Types
+// -------------------------------------------------------------------
+
+export type WaitlistMonitoringStatus = 'active' | 'paused' | 'blocked' | 'completed';
+
+export type WaitlistAvailabilityStatus =
+  | 'waitlisted_only'
+  | 'spot_available'
+  | 'event_full'
+  | 'event_cancelled'
+  | 'registration_closed'
+  | 'unknown';
+
+export type WaitlistChangeType =
+  | 'spot_available'
+  | 'reopened'
+  | 'event_full'
+  | 'waitlist_closed'
+  | 'deadline_passed'
+  | 'event_cancelled'
+  | 'rescheduled'
+  | 'status_unknown';
+
+export interface WaitlistStatusHistoryEntry {
+  timestamp: string;
+  previousStatus: string;
+  newStatus: string;
+  reason: string;
+  verifiedBy: 'playwright' | 'manual' | 'scheduler';
+  evidence?: string;
+  sourceUrl?: string;
+}
+
+export interface WaitlistNotification {
+  id: string;
+  userId: string;
+  registrationId: string;
+  opportunityId: string;
+  eventTitle: string;
+  changeType: WaitlistChangeType;
+  previousStatus?: string;
+  newStatus: string;
+  message: string;
+  sourceUrl?: string;
+  verifiedAt: string;
+  isRead: boolean;
+  actionTaken?: 'pending_review' | 're_registered' | 'dismissed';
+  createdAt: string;
+}
+
+export interface WaitlistInspectionResult {
+  availabilityStatus: WaitlistAvailabilityStatus;
+  detectedChange?: WaitlistChangeType;
+  spotsCount?: number | null;
+  notes: string;
+  evidence: string;
+  sourceUrl: string;
+  verifiedAt: string;
+  isBlockedOrCaptcha?: boolean;
+  blockReason?: string;
+}
+

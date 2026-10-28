@@ -49,9 +49,12 @@ import { AgentActivityView } from './components/AgentActivityView';
 import { TestCasesView } from './components/TestCasesView';
 import { ProfileView } from './components/ProfileView';
 import { SettingsView } from './components/SettingsView';
+import { CommitMateView } from './components/CommitMateView';
+import { WaitlistGuardianView } from './components/WaitlistGuardianView';
 import { OpportunityDetailModal } from './components/OpportunityDetailModal';
 import { RegistrationModal } from './components/RegistrationModal';
 import { CreateOpportunityModal } from './components/CreateOpportunityModal';
+import { findAllRegisteredConflicts } from './lib/commitMateSchedule';
 
 export default function App() {
   // Application view mode: 'landing' | 'signin' | 'dashboard'
@@ -473,6 +476,15 @@ export default function App() {
     return { success: false, error: res.error || 'Failed to save profile changes to database.' };
   };
 
+  const handleUpdatePartialProfile = async (
+    updates: Partial<VolunteerProfile>
+  ): Promise<{ success: boolean; error: string | null }> => {
+    return handleSaveProfile({
+      ...userProfile,
+      ...updates
+    });
+  };
+
   const handleTriggerAgentRescan = async () => {
     await recordAgentRun(
       'eligibility_audit',
@@ -526,6 +538,18 @@ export default function App() {
 
   const registeredOppIds = useMemo(() => {
     return registrations.map((r) => r.opportunityId);
+  }, [registrations]);
+
+  const registeredConflictsCount = useMemo(() => {
+    return findAllRegisteredConflicts(registrations, userProfile).length;
+  }, [registrations, userProfile]);
+
+  const waitlistCount = useMemo(() => {
+    return registrations.filter((r) => r.status === 'waitlisted' || r.monitoringEnabled).length;
+  }, [registrations]);
+
+  const waitlistVacatedCount = useMemo(() => {
+    return registrations.filter((r) => r.availabilityStatus === 'spot_available').length;
   }, [registrations]);
 
   // Loading Screen while verifying session
@@ -621,6 +645,9 @@ export default function App() {
         onCloseMobile={() => setIsMobileSidebarOpen(false)}
         activeMatchCount={opportunities.length}
         registeredCount={registrations.length}
+        conflictCount={registeredConflictsCount}
+        waitlistCount={waitlistCount}
+        waitlistVacatedCount={waitlistVacatedCount}
         userName={userProfile.name || 'Volunteer'}
         supabaseUserId={supabaseUserId}
       />
@@ -737,7 +764,29 @@ export default function App() {
               onCancelRegistration={handleCancelRegistration}
               onLogHours={handleLogHours}
               onGoToDiscover={() => setCurrentDashboardView('discover')}
+              onGoToWaitlist={() => setCurrentDashboardView('waitlist')}
               onRefresh={handleRefreshRegistrations}
+            />
+          )}
+
+          {currentDashboardView === 'commitmate' && (
+            <CommitMateView
+              registrations={registrations}
+              userProfile={userProfile}
+              supabaseUserId={supabaseUserId}
+              onUpdateProfile={handleUpdatePartialProfile}
+              onRefreshRegistrations={handleRefreshRegistrations}
+              onNavigateToDiscover={() => setCurrentDashboardView('discover')}
+            />
+          )}
+
+          {currentDashboardView === 'waitlist' && (
+            <WaitlistGuardianView
+              registrations={registrations}
+              userProfile={userProfile}
+              supabaseUserId={supabaseUserId}
+              onRefreshRegistrations={handleRefreshRegistrations}
+              onNavigateToDiscover={() => setCurrentDashboardView('discover')}
             />
           )}
 
@@ -772,6 +821,7 @@ export default function App() {
       <OpportunityDetailModal
         opportunity={detailModalOpp}
         userProfile={userProfile}
+        registrations={registrations}
         isOpen={Boolean(detailModalOpp)}
         onClose={() => setDetailModalOpp(null)}
         onRequestRegistration={(opp) => {
@@ -787,6 +837,7 @@ export default function App() {
       <RegistrationModal
         opportunity={registrationModalOpp}
         userProfile={userProfile}
+        registrations={registrations}
         isOpen={Boolean(registrationModalOpp)}
         onClose={() => setRegistrationModalOpp(null)}
         onConfirmRegistration={handleConfirmRegistration}

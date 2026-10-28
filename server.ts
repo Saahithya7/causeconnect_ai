@@ -1,3 +1,8 @@
+import WebSocket from 'ws';
+if (typeof globalThis !== 'undefined' && typeof (globalThis as any).WebSocket === 'undefined') {
+  (globalThis as any).WebSocket = WebSocket;
+}
+
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
@@ -12,8 +17,15 @@ import {
 import { ensureValidUuid, isValidUuid } from './src/lib/uuidHelper.js';
 import {
   searchPublicOpportunities,
-  validateTargetUrl
+  validateTargetUrl,
+  withPlaywrightPage,
+  standardNGOAdapter
 } from './src/server/playwrightService.js';
+import {
+  inspectOpportunityAvailability,
+  performWaitlistCheck,
+  processAllMonitoredWaitlists
+} from './src/server/waitlistInspector.js';
 import {
   prepareApplicationWorkflow,
   approveApplicationWorkflow,
@@ -71,7 +83,7 @@ async function startServer() {
   // -------------------------------------------------------------
   // Production Health Check Endpoint
   // -------------------------------------------------------------
-  app.get('/health', (req, res) => {
+  app.get(['/health', '/api/health'], (req, res) => {
     res.json({
       status: 'ok',
       service: 'CauseConnect AI Auto-Apply Backend',
@@ -407,7 +419,27 @@ async function startServer() {
 
       const { data, error } = await queryClient
         .from('registrations')
-        .select('id, user_id, opportunity_id, status, confirmation_reference, submitted_at, created_at, updated_at')
+        .select(`
+          id,
+          user_id,
+          opportunity_id,
+          status,
+          confirmation_reference,
+          submitted_at,
+          created_at,
+          updated_at,
+          google_calendar_event_id,
+          calendar_synced_at,
+          reminders_enabled,
+          monitoring_enabled,
+          monitoring_status,
+          availability_status,
+          last_checked_at,
+          next_check_at,
+          check_retry_count,
+          last_check_error,
+          status_change_history
+        `)
         .eq('user_id', userId)
         .order('created_at', { ascending: false });
 
@@ -423,7 +455,7 @@ async function startServer() {
         try {
           const { data: oppRows } = await serverClient
             .from('opportunities')
-            .select('id, title, organization_name, location, description, required_skills, created_at')
+            .select('id, title, organization_name, location, description, required_skills, source_url, created_at')
             .in('id', oppIds);
           if (oppRows) {
             for (const o of oppRows) {
@@ -485,7 +517,19 @@ async function startServer() {
             : new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
           approvedByUser: true,
           userNotes: row.approval_details?.userNotes || '',
-          hoursLogged: rawStatus === 'completed' ? 4 : 0
+          hoursLogged: rawStatus === 'completed' ? 4 : 0,
+          googleCalendarEventId: row.google_calendar_event_id || undefined,
+          calendarSyncedAt: row.calendar_synced_at || undefined,
+          remindersEnabled: row.reminders_enabled !== false,
+          monitoringEnabled: Boolean(row.monitoring_enabled),
+          monitoringStatus: row.monitoring_status || (mappedStatus === 'waitlisted' ? 'active' : 'paused'),
+          availabilityStatus: row.availability_status || (mappedStatus === 'waitlisted' ? 'waitlisted_only' : 'unknown'),
+          lastCheckedAt: row.last_checked_at || undefined,
+          nextCheckAt: row.next_check_at || undefined,
+          checkRetryCount: row.check_retry_count || 0,
+          lastCheckError: row.last_check_error || undefined,
+          statusChangeHistory: row.status_change_history || [],
+          sourceUrl: opp?.source_url || undefined
         };
       });
 
@@ -657,7 +701,23 @@ async function startServer() {
 
       let row = existingReg;
 
-      if (!existingReg) {
+      if (existingReg) {
+        const { data: updatedReg, error: updateErr } = await writeClient
+          .from('registrations')
+          .update({
+            status: dbStatus,
+            confirmation_reference: confirmationReference || existingReg.confirmation_reference,
+            submitted_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', existingReg.id)
+          .select('id, user_id, opportunity_id, status, confirmation_reference, submitted_at, created_at, updated_at')
+          .single();
+
+        if (!updateErr && updatedReg) {
+          row = updatedReg;
+        }
+      } else {
         const { data: newReg, error: insertErr } = await writeClient
           .from('registrations')
           .insert(payload)
@@ -827,6 +887,693 @@ async function startServer() {
       res.json({ success: true, testRuns });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err?.message || 'Failed to retrieve test runs' });
+    }
+  });
+
+  // -------------------------------------------------------------
+  // Section 6: CommitMate — Availability, Calendar & Reminders Engine
+  // -------------------------------------------------------------
+
+  /**
+   * Helper to process due reminders automatically in background
+   */
+  async function processDueReminders() {
+    try {
+      const serverClient = getSupabaseServerClient();
+      const nowIso = new Date().toISOString();
+
+      const { data: dueReminders, error } = await serverClient
+        .from('event_reminders')
+        .select('*')
+        .eq('status', 'scheduled')
+        .lte('scheduled_for', nowIso)
+        .limit(25);
+
+      if (error || !dueReminders || dueReminders.length === 0) {
+        return { processed: 0 };
+      }
+
+      for (const rem of dueReminders) {
+        await serverClient
+          .from('event_reminders')
+          .update({
+            status: 'delivered',
+            delivered_at: nowIso,
+            updated_at: nowIso
+          })
+          .eq('id', rem.id);
+
+        console.log(`[CommitMate Scheduler] Delivered ${rem.reminder_type} reminder for "${rem.opportunity_title}" (ID: ${rem.id})`);
+      }
+
+      return { processed: dueReminders.length };
+    } catch (err: any) {
+      return { processed: 0, error: err?.message };
+    }
+  }
+
+  // Periodic background scheduler running every 60 seconds
+  setInterval(processDueReminders, 60 * 1000);
+
+  /**
+   * PATCH /api/registrations/:id/calendar-sync
+   * Updates registration record with Google Calendar event reference
+   */
+  app.patch('/api/registrations/:id/calendar-sync', async (req, res) => {
+    try {
+      const serverClient = getSupabaseServerClient();
+      const regId = req.params.id;
+      const { calendarEventId } = req.body || {};
+
+      if (!calendarEventId) {
+        return res.status(400).json({ success: false, error: 'calendarEventId is required' });
+      }
+
+      const { error } = await serverClient
+        .from('registrations')
+        .update({
+          google_calendar_event_id: calendarEventId,
+          calendar_synced_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', regId);
+
+      if (error) {
+        return res.status(500).json({ success: false, error: error.message });
+      }
+
+      res.json({ success: true, registrationId: regId, calendarEventId });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Failed to sync calendar reference' });
+    }
+  });
+
+  /**
+   * GET /api/commitmate/reminders
+   * Fetch scheduled and delivered reminders for authenticated volunteer
+   */
+  app.get('/api/commitmate/reminders', async (req, res) => {
+    try {
+      const serverClient = getSupabaseServerClient();
+      const userId = (req.query.userId as string) || (req.headers['x-user-id'] as string);
+
+      if (!userId) {
+        return res.status(400).json({ success: false, reminders: [], error: 'userId is required' });
+      }
+
+      const { data, error } = await serverClient
+        .from('event_reminders')
+        .select('*')
+        .eq('user_id', userId)
+        .order('scheduled_for', { ascending: true });
+
+      if (error) {
+        return res.status(500).json({ success: false, reminders: [], error: error.message });
+      }
+
+      const reminders = (data || []).map((row: any) => ({
+        id: row.id,
+        userId: row.user_id,
+        registrationId: row.registration_id,
+        opportunityId: row.opportunity_id,
+        opportunityTitle: row.opportunity_title,
+        reminderType: row.reminder_type,
+        scheduledFor: row.scheduled_for,
+        status: row.status,
+        deliveredAt: row.delivered_at,
+        channel: row.channel,
+        message: row.message,
+        isRead: Boolean(row.is_read),
+        createdAt: row.created_at
+      }));
+
+      res.json({ success: true, reminders });
+    } catch (err: any) {
+      res.status(500).json({ success: false, reminders: [], error: err?.message || 'Failed to fetch reminders' });
+    }
+  });
+
+  /**
+   * POST /api/commitmate/reminders
+   * Schedules a new reminder
+   */
+  app.post('/api/commitmate/reminders', async (req, res) => {
+    try {
+      const serverClient = getSupabaseServerClient();
+      const {
+        userId,
+        registrationId,
+        opportunityId,
+        opportunityTitle,
+        reminderType,
+        scheduledFor,
+        channel,
+        message
+      } = req.body || {};
+
+      if (!userId || !opportunityTitle || !scheduledFor) {
+        return res.status(400).json({ success: false, error: 'userId, opportunityTitle, and scheduledFor are required' });
+      }
+
+      const payload = {
+        user_id: userId,
+        registration_id: registrationId || null,
+        opportunity_id: opportunityId || null,
+        opportunity_title: opportunityTitle,
+        reminder_type: reminderType || 'custom',
+        scheduled_for: scheduledFor,
+        status: 'scheduled',
+        channel: channel || 'in_app',
+        message: message || `Reminder: Upcoming volunteer commitment for ${opportunityTitle}`
+      };
+
+      const { data, error } = await serverClient
+        .from('event_reminders')
+        .insert(payload)
+        .select()
+        .single();
+
+      if (error) {
+        return res.status(500).json({ success: false, error: error.message });
+      }
+
+      res.json({
+        success: true,
+        reminder: {
+          id: data.id,
+          userId: data.user_id,
+          registrationId: data.registration_id,
+          opportunityId: data.opportunity_id,
+          opportunityTitle: data.opportunity_title,
+          reminderType: data.reminder_type,
+          scheduledFor: data.scheduled_for,
+          status: data.status,
+          deliveredAt: data.delivered_at,
+          channel: data.channel,
+          message: data.message,
+          isRead: Boolean(data.is_read),
+          createdAt: data.created_at
+        }
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Failed to schedule reminder' });
+    }
+  });
+
+  /**
+   * PATCH /api/commitmate/reminders/:id/read
+   * Marks a reminder as read
+   */
+  app.patch('/api/commitmate/reminders/:id/read', async (req, res) => {
+    try {
+      const serverClient = getSupabaseServerClient();
+      const reminderId = req.params.id;
+
+      const { error } = await serverClient
+        .from('event_reminders')
+        .update({ is_read: true, updated_at: new Date().toISOString() })
+        .eq('id', reminderId);
+
+      if (error) {
+        return res.status(500).json({ success: false, error: error.message });
+      }
+
+      res.json({ success: true, reminderId });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Failed to update reminder' });
+    }
+  });
+
+  /**
+   * POST /api/commitmate/reminders/process
+   * Manually trigger reminder delivery check
+   */
+  app.post('/api/commitmate/reminders/process', async (req, res) => {
+    const result = await processDueReminders();
+    res.json({ success: true, ...result });
+  });
+
+  // -------------------------------------------------------------
+  // Section 7: WaitlistGuardian — Availability & Cancellation Agent
+  // -------------------------------------------------------------
+
+  // Periodic WaitlistGuardian background scheduler (runs every 2 minutes)
+  setInterval(() => {
+    processAllMonitoredWaitlists().catch((err) => {
+      console.warn('[WaitlistGuardian Background Worker Error]:', err?.message);
+    });
+  }, 120 * 1000);
+
+  /**
+   * GET /api/waitlist/registrations
+   * Fetches user's waitlisted and monitored registrations
+   */
+  app.get('/api/waitlist/registrations', async (req, res) => {
+    try {
+      const serverClient = getSupabaseServerClient();
+      let userId = (req.query.userId as string) || (req.headers['x-user-id'] as string);
+      const authHeader = req.headers.authorization;
+      if (authHeader?.startsWith('Bearer ')) {
+        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+        const { data: authData } = await serverClient.auth.getUser(token);
+        if (authData?.user) userId = authData.user.id;
+      }
+
+      if (!userId) {
+        return res.status(400).json({ success: false, registrations: [], error: 'User ID is required' });
+      }
+
+      const { data, error } = await serverClient
+        .from('registrations')
+        .select(`
+          id,
+          user_id,
+          opportunity_id,
+          status,
+          confirmation_reference,
+          submitted_at,
+          created_at,
+          updated_at,
+          google_calendar_event_id,
+          calendar_synced_at,
+          reminders_enabled,
+          monitoring_enabled,
+          monitoring_status,
+          availability_status,
+          last_checked_at,
+          next_check_at,
+          check_retry_count,
+          last_check_error,
+          status_change_history
+        `)
+        .eq('user_id', userId)
+        .or('status.eq.waitlisted,monitoring_enabled.eq.true')
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        return res.status(500).json({ success: false, registrations: [], error: error.message });
+      }
+
+      // Query opportunity details
+      const oppIds = Array.from(new Set((data || []).map((r: any) => String(r.opportunity_id)).filter(Boolean)));
+      const oppMap: Record<string, any> = {};
+      if (oppIds.length > 0) {
+        const { data: oppRows } = await serverClient
+          .from('opportunities')
+          .select('id, title, organization_name, location, description, required_skills, source_url, created_at')
+          .in('id', oppIds);
+        if (oppRows) {
+          for (const o of oppRows) oppMap[o.id] = o;
+        }
+      }
+
+      const mapped = (data || []).map((row: any) => {
+        const opp = oppMap[String(row.opportunity_id)];
+        const oppTitle = opp?.title || 'Volunteer Commitment';
+        const oppOrg = opp?.organization_name || 'Community Partner';
+        const oppLoc = opp?.location || 'Local Community Site';
+        const isRemote = oppLoc.toLowerCase().includes('online') || oppLoc.toLowerCase().includes('remote');
+
+        return {
+          id: String(row.id),
+          opportunityId: String(row.opportunity_id),
+          opportunityTitle: oppTitle,
+          organization: oppOrg,
+          category: opp?.cause_name || 'Community Service',
+          date: opp?.created_at
+            ? new Date(opp.created_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+            : 'Upcoming Weekend',
+          time: '10:00 AM - 1:00 PM',
+          location: oppLoc,
+          format: isRemote ? 'online' : 'in-person',
+          status: row.status,
+          submittedAt: row.submitted_at
+            ? new Date(row.submitted_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+            : new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+          approvedByUser: true,
+          monitoringEnabled: Boolean(row.monitoring_enabled),
+          monitoringStatus: row.monitoring_status || 'active',
+          availabilityStatus: row.availability_status || 'waitlisted_only',
+          lastCheckedAt: row.last_checked_at || undefined,
+          nextCheckAt: row.next_check_at || undefined,
+          checkRetryCount: row.check_retry_count || 0,
+          lastCheckError: row.last_check_error || undefined,
+          statusChangeHistory: row.status_change_history || [],
+          sourceUrl: opp?.source_url || 'https://causeconnect.org'
+        };
+      });
+
+      res.json({ success: true, registrations: mapped });
+    } catch (err: any) {
+      res.status(500).json({ success: false, registrations: [], error: err?.message || 'Failed to fetch waitlist' });
+    }
+  });
+
+  /**
+   * PATCH /api/waitlist/:id/toggle
+   * Enables or disables availability monitoring for a waitlisted event
+   */
+  app.patch('/api/waitlist/:id/toggle', async (req, res) => {
+    try {
+      const serverClient = getSupabaseServerClient();
+      const regId = req.params.id;
+      const { enabled } = req.body || {};
+
+      const isEnabled = Boolean(enabled);
+      const updateData: Record<string, any> = {
+        monitoring_enabled: isEnabled,
+        monitoring_status: isEnabled ? 'active' : 'paused',
+        updated_at: new Date().toISOString()
+      };
+
+      if (isEnabled) {
+        updateData.next_check_at = new Date().toISOString(); // Schedule immediate check
+      }
+
+      const { data, error } = await serverClient
+        .from('registrations')
+        .update(updateData)
+        .eq('id', regId)
+        .select()
+        .single();
+
+      if (error) {
+        return res.status(500).json({ success: false, error: error.message });
+      }
+
+      res.json({
+        success: true,
+        registrationId: regId,
+        monitoringEnabled: data.monitoring_enabled,
+        monitoringStatus: data.monitoring_status
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Failed to toggle monitoring' });
+    }
+  });
+
+  /**
+   * POST /api/waitlist/:id/check-now
+   * Performs manual status check on demand using Playwright
+   */
+  app.post('/api/waitlist/:id/check-now', async (req, res) => {
+    try {
+      const serverClient = getSupabaseServerClient();
+      const regId = req.params.id;
+      let userId = (req.body?.userId as string) || (req.headers['x-user-id'] as string);
+      const authHeader = req.headers.authorization;
+      if (authHeader?.startsWith('Bearer ')) {
+        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+        const { data: authData } = await serverClient.auth.getUser(token);
+        if (authData?.user) userId = authData.user.id;
+      }
+
+      if (!userId) {
+        const { data: rRow } = await serverClient.from('registrations').select('user_id').eq('id', regId).single();
+        if (rRow) userId = rRow.user_id;
+      }
+
+      const checkResult = await performWaitlistCheck(regId, userId || '00000000-0000-0000-0000-000000000000', {
+        verifiedBy: 'manual',
+        forceStatus: req.body?.forceStatus
+      });
+
+      if (!checkResult.success) {
+        return res.status(400).json(checkResult);
+      }
+
+      res.json(checkResult);
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Check failed' });
+    }
+  });
+
+  /**
+   * GET /api/waitlist/notifications
+   * Retrieves verified availability and cancellation notifications
+   */
+  app.get('/api/waitlist/notifications', async (req, res) => {
+    try {
+      const serverClient = getSupabaseServerClient();
+      let userId = (req.query.userId as string) || (req.headers['x-user-id'] as string);
+      const authHeader = req.headers.authorization;
+      if (authHeader?.startsWith('Bearer ')) {
+        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+        const { data: authData } = await serverClient.auth.getUser(token);
+        if (authData?.user) userId = authData.user.id;
+      }
+
+      if (!userId) {
+        return res.status(400).json({ success: false, notifications: [], error: 'userId is required' });
+      }
+
+      const { data, error } = await serverClient
+        .from('waitlist_notifications')
+        .select('*')
+        .eq('user_id', userId)
+        .order('verified_at', { ascending: false })
+        .limit(50);
+
+      if (error) {
+        return res.status(500).json({ success: false, notifications: [], error: error.message });
+      }
+
+      const notifications = (data || []).map((row: any) => ({
+        id: row.id,
+        userId: row.user_id,
+        registrationId: row.registration_id,
+        opportunityId: row.opportunity_id,
+        eventTitle: row.event_title,
+        changeType: row.change_type,
+        previousStatus: row.previous_status,
+        newStatus: row.new_status,
+        message: row.message,
+        sourceUrl: row.source_url,
+        verifiedAt: row.verified_at,
+        isRead: Boolean(row.is_read),
+        actionTaken: row.action_taken,
+        createdAt: row.created_at
+      }));
+
+      res.json({ success: true, notifications });
+    } catch (err: any) {
+      res.status(500).json({ success: false, notifications: [], error: err?.message || 'Failed to fetch notifications' });
+    }
+  });
+
+  /**
+   * PATCH /api/waitlist/notifications/:id/read
+   * Marks a waitlist notification as read
+   */
+  app.patch('/api/waitlist/notifications/:id/read', async (req, res) => {
+    try {
+      const serverClient = getSupabaseServerClient();
+      const notifId = req.params.id;
+
+      const { error } = await serverClient
+        .from('waitlist_notifications')
+        .update({ is_read: true })
+        .eq('id', notifId);
+
+      if (error) {
+        return res.status(500).json({ success: false, error: error.message });
+      }
+
+      res.json({ success: true, notificationId: notifId });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message });
+    }
+  });
+
+  /**
+   * POST /api/waitlist/process-scheduler
+   * Protected trigger for automated scheduled monitoring
+   */
+  app.post('/api/waitlist/process-scheduler', async (req, res) => {
+    try {
+      const result = await processAllMonitoredWaitlists();
+      res.json({ success: true, ...result });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err?.message || 'Scheduler failed' });
+    }
+  });
+
+  /**
+   * POST /api/waitlist/:id/re-register
+   * Safe Re-registration Workflow:
+   * 1. Re-verifies spot availability
+   * 2. Requires explicit user approval
+   * 3. Executes ApplyPilot registration via Playwright
+   * 4. Updates Supabase registration record ONLY after success is confirmed
+   * 5. If fails, preserves existing waitlist record and logs actual failure reason
+   */
+  app.post('/api/waitlist/:id/re-register', async (req, res) => {
+    try {
+      const serverClient = getSupabaseServerClient();
+      const regId = req.params.id;
+      const { explicitConsentGiven, userNotes } = req.body || {};
+
+      if (!explicitConsentGiven) {
+        return res.status(400).json({
+          success: false,
+          error: 'Explicit user approval is strictly required before submitting application.'
+        });
+      }
+
+      // 1. Fetch current registration and linked opportunity
+      const { data: reg, error: regError } = await serverClient
+        .from('registrations')
+        .select(`
+          id,
+          user_id,
+          opportunity_id,
+          status,
+          monitoring_enabled,
+          availability_status,
+          status_change_history,
+          opportunities (
+            id,
+            title,
+            organization_name,
+            source_url,
+            location,
+            min_age,
+            background_check_required,
+            required_skills
+          )
+        `)
+        .eq('id', regId)
+        .single();
+
+      if (regError || !reg) {
+        return res.status(404).json({ success: false, error: 'Registration not found' });
+      }
+
+      const opp = Array.isArray(reg.opportunities) ? reg.opportunities[0] : reg.opportunities;
+      if (!opp) {
+        return res.status(400).json({ success: false, error: 'Linked opportunity not found' });
+      }
+
+      // 2. Fetch volunteer profile
+      const profile = await getProfileByUserId(reg.user_id);
+      if (!profile) {
+        return res.status(400).json({ success: false, error: 'Volunteer profile not found' });
+      }
+
+      // 3. Re-verify age and eligibility
+      const eligibility = evaluateEligibility(profile, opp);
+      if (eligibility.status === 'Ineligible') {
+        return res.status(400).json({
+          success: false,
+          error: `Eligibility check failed: ${eligibility.reasons.join('; ')}`
+        });
+      }
+
+      // 4. Execute registration with Playwright browser automation
+      let executionSuccess = false;
+      let verificationEvidence = '';
+      let confirmationReference = '';
+      let executionError = '';
+
+      try {
+        const destUrl = opp.source_url || 'https://causeconnect.org';
+        const outcome = await withPlaywrightPage(async (page) => {
+          return await standardNGOAdapter.submit(page, {
+            profile,
+            event: {
+              id: String(opp.id),
+              title: opp.title,
+              organization: opp.organization_name || 'Community Partner',
+              destinationUrl: destUrl
+            },
+            consents: {
+              backgroundCheck: Boolean(profile.backgroundCheckConsent),
+              terms: true
+            }
+          });
+        }, { timeoutMs: 20000 });
+
+        if (outcome.status === 'verified') {
+          executionSuccess = true;
+          verificationEvidence = outcome.evidenceText;
+          confirmationReference = outcome.confirmationReference || `WL-CLAIM-${Math.floor(10000 + Math.random() * 90000)}`;
+        } else if (outcome.status === 'waitlisted') {
+          executionSuccess = false;
+          executionError = 'Event returned waitlisted status again; spot was filled before submission could finalize.';
+        } else {
+          executionSuccess = false;
+          executionError = outcome.evidenceText || 'Registration submission was not accepted by destination website.';
+        }
+      } catch (pwErr: any) {
+        executionSuccess = false;
+        executionError = pwErr?.message || 'Playwright browser automation encountered an unexpected error.';
+      }
+
+      // 5. Update Supabase record ONLY after success is confirmed
+      if (!executionSuccess) {
+        // Preserve existing waitlist record!
+        await serverClient
+          .from('registrations')
+          .update({
+            last_check_error: executionError,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', regId);
+
+        return res.status(400).json({
+          success: false,
+          error: executionError || 'Re-registration failed to confirm. Your waitlist position has been preserved.'
+        });
+      }
+
+      // Success confirmed: Update status to 'confirmed', monitoring to 'completed'
+      const history = Array.isArray(reg.status_change_history) ? [...reg.status_change_history] : [];
+      history.unshift({
+        timestamp: new Date().toISOString(),
+        previousStatus: reg.status,
+        newStatus: 'confirmed',
+        reason: 'Volunteer claimed available spot via WaitlistGuardian safe re-registration.',
+        verifiedBy: 'playwright',
+        evidence: verificationEvidence
+      });
+
+      const { data: updatedReg, error: updateErr } = await serverClient
+        .from('registrations')
+        .update({
+          status: 'confirmed',
+          availability_status: 'spot_available',
+          monitoring_status: 'completed',
+          confirmation_reference: confirmationReference,
+          last_checked_at: new Date().toISOString(),
+          status_change_history: history.slice(0, 25),
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', regId)
+        .select()
+        .single();
+
+      if (updateErr) {
+        console.error('[Re-register DB update error]:', updateErr);
+      }
+
+      // Mark related notification as action_taken = 're_registered'
+      await serverClient
+        .from('waitlist_notifications')
+        .update({ action_taken: 're_registered', is_read: true })
+        .eq('registration_id', regId);
+
+      res.json({
+        success: true,
+        registration: updatedReg || { ...reg, status: 'confirmed', confirmation_reference: confirmationReference },
+        verificationEvidence,
+        confirmationReference
+      });
+    } catch (err: any) {
+      console.error('[API /api/waitlist/re-register error]:', err);
+      res.status(500).json({
+        success: false,
+        error: err?.message || 'Re-registration encountered an internal error. Existing record preserved.'
+      });
     }
   });
 

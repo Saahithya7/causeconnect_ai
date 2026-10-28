@@ -12,13 +12,18 @@ import {
   Mail,
   Users,
   Award,
-  Sparkles
+  Sparkles,
+  AlertTriangle,
+  HelpCircle,
+  CalendarCheck
 } from 'lucide-react';
-import { Opportunity, VolunteerProfile } from '../types';
+import { Opportunity, VolunteerProfile, Registration } from '../types';
+import { detectScheduleConflicts } from '../lib/commitMateSchedule';
 
 interface OpportunityDetailModalProps {
   opportunity: Opportunity | null;
   userProfile: VolunteerProfile;
+  registrations?: Registration[];
   isOpen: boolean;
   onClose: () => void;
   onRequestRegistration: (opp: Opportunity) => void;
@@ -28,6 +33,7 @@ interface OpportunityDetailModalProps {
 export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
   opportunity,
   userProfile,
+  registrations = [],
   isOpen,
   onClose,
   onRequestRegistration,
@@ -36,6 +42,7 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
   if (!isOpen || !opportunity) return null;
 
   const meetsAge = userProfile.age >= opportunity.minAge;
+  const scheduleConflict = detectScheduleConflicts(opportunity, registrations, userProfile);
 
   return (
     <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
@@ -214,12 +221,36 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
                 </span>
               </div>
 
-              <div className="flex items-center justify-between py-1.5">
+              <div className="flex items-center justify-between py-1.5 border-b border-[#D5E0D7]/50">
                 <span className="text-[#244C3A]/70">Volunteer Hours Certification</span>
                 <span className="font-semibold text-emerald-700 flex items-center gap-1">
                   <CheckCircle2 className="w-3.5 h-3.5" />
                   Eligible for certified volunteer hours log
                 </span>
+              </div>
+
+              {/* CommitMate Availability Check Row */}
+              <div className="flex items-center justify-between py-1.5">
+                <span className="text-[#244C3A]/70 flex items-center gap-1">
+                  <CalendarCheck className="w-3.5 h-3.5 text-[#315D48]" />
+                  <span>CommitMate Schedule Status</span>
+                </span>
+                {scheduleConflict.hasConflict ? (
+                  <span className="font-semibold text-red-700 flex items-center gap-1">
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    Conflict: {scheduleConflict.conflictDescription}
+                  </span>
+                ) : scheduleConflict.isIncomplete ? (
+                  <span className="font-semibold text-amber-700 flex items-center gap-1">
+                    <HelpCircle className="w-3.5 h-3.5" />
+                    Timing check incomplete
+                  </span>
+                ) : (
+                  <span className="font-semibold text-emerald-700 flex items-center gap-1">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    Schedule clear · No overlap
+                  </span>
+                )}
               </div>
             </div>
           </div>

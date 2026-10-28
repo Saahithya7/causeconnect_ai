@@ -4,6 +4,7 @@ import {
   Compass,
   Heart,
   Calendar,
+  CalendarCheck,
   Activity,
   FlaskConical,
   User,
@@ -12,6 +13,7 @@ import {
   ExternalLink,
   LogOut,
   ShieldCheck,
+  ShieldAlert,
   Database
 } from 'lucide-react';
 import { Logo } from './Logo';
@@ -21,6 +23,8 @@ export type DashboardView =
   | 'discover'
   | 'matches'
   | 'registered'
+  | 'commitmate'
+  | 'waitlist'
   | 'agent'
   | 'tests'
   | 'profile'
@@ -35,6 +39,9 @@ interface SidebarProps {
   onCloseMobile: () => void;
   activeMatchCount?: number;
   registeredCount?: number;
+  conflictCount?: number;
+  waitlistCount?: number;
+  waitlistVacatedCount?: number;
   userName?: string;
   supabaseUserId?: string | null;
 }
@@ -48,6 +55,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onCloseMobile,
   activeMatchCount = 0,
   registeredCount = 0,
+  conflictCount = 0,
+  waitlistCount = 0,
+  waitlistVacatedCount = 0,
   userName = 'Volunteer',
   supabaseUserId
 }) => {
@@ -73,6 +83,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
       label: 'Registered Events',
       icon: Calendar,
       badge: registeredCount > 0 ? registeredCount : undefined
+    },
+    {
+      id: 'commitmate' as DashboardView,
+      label: 'CommitMate Agent',
+      icon: CalendarCheck,
+      badge: conflictCount > 0 ? `${conflictCount} conflict${conflictCount > 1 ? 's' : ''}` : undefined
+    },
+    {
+      id: 'waitlist' as DashboardView,
+      label: 'WaitlistGuardian',
+      icon: ShieldAlert,
+      badge: waitlistVacatedCount > 0 ? `${waitlistVacatedCount} open!` : waitlistCount > 0 ? waitlistCount : undefined
     },
     {
       id: 'agent' as DashboardView,

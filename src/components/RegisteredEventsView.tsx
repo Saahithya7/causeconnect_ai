@@ -11,7 +11,8 @@ import {
   Trash2,
   PlusCircle,
   ArrowRight,
-  RefreshCw
+  RefreshCw,
+  ShieldAlert
 } from 'lucide-react';
 import { Registration } from '../types';
 
@@ -20,6 +21,7 @@ interface RegisteredEventsViewProps {
   onCancelRegistration: (id: string) => void;
   onLogHours: (id: string, hours: number) => void;
   onGoToDiscover: () => void;
+  onGoToWaitlist?: () => void;
   onRefresh?: () => void;
 }
 
@@ -28,6 +30,7 @@ export const RegisteredEventsView: React.FC<RegisteredEventsViewProps> = ({
   onCancelRegistration,
   onLogHours,
   onGoToDiscover,
+  onGoToWaitlist,
   onRefresh
 }) => {
   const [selectedRegForHours, setSelectedRegForHours] = useState<Registration | null>(null);
@@ -210,9 +213,19 @@ export const RegisteredEventsView: React.FC<RegisteredEventsViewProps> = ({
 
                 {/* Actions */}
                 <div className="flex flex-col sm:flex-row md:flex-col lg:flex-row items-stretch sm:items-center gap-2.5 shrink-0">
+                  {reg.status === 'waitlisted' && onGoToWaitlist && (
+                    <button
+                      onClick={onGoToWaitlist}
+                      className="px-3.5 py-2 rounded-xl bg-amber-100 hover:bg-amber-200 text-amber-950 text-xs font-bold flex items-center justify-center gap-1.5 transition-colors shadow-2xs cursor-pointer"
+                    >
+                      <ShieldAlert className="w-3.5 h-3.5 text-amber-800" />
+                      <span>WaitlistGuardian</span>
+                    </button>
+                  )}
+
                   <button
                     onClick={() => handleDownloadCalendar(reg)}
-                    className="px-3.5 py-2 rounded-xl border border-[#D5DACA] bg-white hover:bg-[#E8F0E9] text-xs font-semibold text-[#244C3A] flex items-center justify-center gap-1.5 transition-colors"
+                    className="px-3.5 py-2 rounded-xl border border-[#D5DACA] bg-white hover:bg-[#E8F0E9] text-xs font-semibold text-[#244C3A] flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
                   >
                     <Download className="w-3.5 h-3.5 text-[#315D48]" />
                     <span>Add to Calendar</span>

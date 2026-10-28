@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   X,
   CheckCircle2,
@@ -43,10 +43,12 @@ import {
   approveRegistration,
   executeRegistration
 } from '../services/registrationAgentService';
+import { detectScheduleConflicts } from '../lib/commitMateSchedule';
 
 interface RegistrationModalProps {
   opportunity: Opportunity | null;
   userProfile: VolunteerProfile;
+  registrations?: Registration[];
   isOpen: boolean;
   onClose: () => void;
   onConfirmRegistration: (
@@ -62,6 +64,7 @@ interface RegistrationModalProps {
 export const RegistrationModal: React.FC<RegistrationModalProps> = ({
   opportunity,
   userProfile,
+  registrations = [],
   isOpen,
   onClose,
   onConfirmRegistration,
@@ -96,6 +99,38 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
   const [volunteerAge, setVolunteerAge] = useState<number>(userProfile.age || 21);
   const [volunteerDob, setVolunteerDob] = useState<string>(userProfile.dateOfBirth || '');
   const [volunteerPhone, setVolunteerPhone] = useState<string>(userProfile.phone || '');
+
+  // CommitMate Schedule Conflict Evaluation
+  const scheduleConflict = useMemo(() => {
+    if (!opportunity) return null;
+    return detectScheduleConflicts(opportunity, registrations || [], userProfile);
+  }, [opportunity, registrations, userProfile]);
+
+  // Verified Destination URL & Domain
+  const destinationUrl = useMemo(() => {
+    const raw = (proposal?.destinationUrl || (opportunity as any)?.applicationUrl || (opportunity as any)?.registrationUrl || opportunity?.sourceUrl || '').trim();
+    if (!raw || raw.toLowerCase() === 'public-web' || raw.includes('//public-web')) {
+      return '';
+    }
+    return raw;
+  }, [proposal, opportunity]);
+
+  const isDestinationUsable = useMemo(() => {
+    return Boolean(
+      destinationUrl &&
+      (destinationUrl.startsWith('http://') || destinationUrl.startsWith('https://')) &&
+      !destinationUrl.includes('public-web')
+    );
+  }, [destinationUrl]);
+
+  const destinationDomain = useMemo(() => {
+    if (!destinationUrl) return opportunity?.sourceDomain && opportunity.sourceDomain !== 'public-web' ? opportunity.sourceDomain : 'causeconnect.org';
+    try {
+      return new URL(destinationUrl).hostname.replace(/^www\./, '');
+    } catch {
+      return opportunity?.sourceDomain && opportunity.sourceDomain !== 'public-web' ? opportunity.sourceDomain : 'causeconnect.org';
+    }
+  }, [destinationUrl, opportunity]);
 
   // Pre-flight eligibility evaluation on modal open
   useEffect(() => {
@@ -204,10 +239,14 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
         throw new Error(approvalRes.error || 'Failed to record explicit proposal approval.');
       }
 
-      // 2. Execute registration workflow with independent verification
+      // 2. Execute registration workflow with independent Playwright verification
       const execRes = await executeRegistration(proposal.proposalId);
-      if (!execRes.success && execRes.state === 'failed') {
-        throw new Error(execRes.error || 'Failed to execute registration workflow.');
+      if (!execRes.success || !execRes.verificationResult) {
+        throw new Error(execRes.error || 'Registration execution could not be verified by destination portal.');
+      }
+
+      if (execRes.verificationResult.status === 'failed' || execRes.state === 'failed') {
+        throw new Error(execRes.error || 'Target organization registration could not be completed.');
       }
 
       // 3. Determine verified outcome status
@@ -454,6 +493,69 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
                 </div>
               </div>
 
+              {/* CommitMate Schedule & Availability Conflict Check */}
+              {scheduleConflict && (
+                <div
+                  className={`p-4 rounded-2xl border text-xs space-y-2 transition-all ${
+                    scheduleConflict.hasConflict
+                      ? 'bg-red-50 border-red-200 text-red-900'
+                      : scheduleConflict.isIncomplete
+                      ? 'bg-blue-50/80 border-blue-200 text-blue-900'
+                      : 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  }`}
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold uppercase tracking-wider text-[11px] flex items-center gap-1.5">
+                      {scheduleConflict.hasConflict ? (
+                        <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
+                      ) : scheduleConflict.isIncomplete ? (
+                        <HelpCircle className="w-4 h-4 text-blue-600 shrink-0" />
+                      ) : (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      )}
+                      <span>CommitMate Availability Check</span>
+                    </span>
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                        scheduleConflict.hasConflict
+                          ? 'bg-red-100 text-red-800'
+                          : scheduleConflict.isIncomplete
+                          ? 'bg-blue-100 text-blue-800'
+                          : 'bg-emerald-100 text-emerald-800'
+                      }`}
+                    >
+                      {scheduleConflict.hasConflict
+                        ? 'Conflict Detected'
+                        : scheduleConflict.isIncomplete
+                        ? 'Timing Advisory (Flexible)'
+                        : 'Schedule Clear'}
+                    </span>
+                  </div>
+
+                  <p className="font-medium text-xs leading-relaxed">
+                    {scheduleConflict.hasConflict
+                      ? scheduleConflict.conflictDescription
+                      : scheduleConflict.isIncomplete
+                      ? (scheduleConflict.incompleteReason || 'Event timing is flexible or self-scheduled. Schedule conflict check is advisory and does not block your application.')
+                      : 'No schedule overlaps detected with your registered commitments or preferred volunteering window.'}
+                  </p>
+
+                  {scheduleConflict.isIncomplete && !scheduleConflict.hasConflict && (
+                    <div className="text-[11px] bg-white/70 p-2 rounded-xl border border-blue-200 text-blue-800 flex items-center gap-1.5">
+                      <Check className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                      <span>Advisory note: ApplyPilot will proceed with your registration for this flexible opportunity.</span>
+                    </div>
+                  )}
+
+                  {scheduleConflict.conflictingRegistration && (
+                    <div className="text-[11px] font-mono bg-white/80 p-2.5 rounded-xl border border-red-200 text-red-950">
+                      <span className="font-semibold block">Conflicting Registered Event:</span>
+                      <span>{scheduleConflict.conflictingRegistration.opportunityTitle}</span> ({scheduleConflict.conflictingRegistration.date} · {scheduleConflict.conflictingRegistration.time})
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Step A & B: Authenticated Volunteer Profile Retrieval */}
               <div className="space-y-2.5">
                 <div className="flex items-center justify-between">
@@ -589,14 +691,52 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
                       <span className="text-[10px] font-bold text-[#59665C] uppercase tracking-wider">
                         Destination Page (SSRF & Internal IP Guarded)
                       </span>
-                      <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-medium flex items-center gap-1">
-                        <Check className="w-3 h-3" />
-                        Safe Public Host
-                      </span>
+                      {isDestinationUsable ? (
+                        <span className="px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-medium flex items-center gap-1">
+                          <Check className="w-3 h-3" />
+                          Safe Public Host
+                        </span>
+                      ) : (
+                        <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 border border-amber-300 text-[10px] font-medium flex items-center gap-1">
+                          <AlertTriangle className="w-3 h-3 text-amber-700" />
+                          No Automated Form URL
+                        </span>
+                      )}
                     </div>
-                    <div className="font-mono text-xs text-[#244C3A] truncate bg-white p-2 rounded-lg border border-[#D5E0D7]">
-                      {proposal?.destinationUrl || (opportunity as any).registrationUrl || opportunity.sourceUrl || opportunity.sourceDomain}
-                    </div>
+
+                    {isDestinationUsable ? (
+                      <div className="flex items-center justify-between gap-2 bg-white p-2 rounded-lg border border-[#D5E0D7]">
+                        <span className="font-mono text-xs text-[#244C3A] truncate">
+                          {destinationUrl}
+                        </span>
+                        <a
+                          href={destinationUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-[#315D48] hover:text-[#244C3A] inline-flex items-center gap-1 shrink-0 text-[11px] font-medium hover:underline"
+                        >
+                          <span>Inspect</span>
+                          <ExternalLink className="w-3 h-3" />
+                        </a>
+                      </div>
+                    ) : (
+                      <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-amber-900 space-y-2">
+                        <p className="font-medium text-xs">
+                          No direct automated registration form URL is configured for this opportunity. Auto-Apply is disabled to prevent unverified submissions.
+                        </p>
+                        {opportunity.sourceUrl && opportunity.sourceUrl !== 'public-web' && (
+                          <a
+                            href={opportunity.sourceUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#244C3A] text-white text-xs font-semibold hover:bg-[#315D48] transition-colors"
+                          >
+                            <span>Open Official Organization Page</span>
+                            <ExternalLink className="w-3.5 h-3.5" />
+                          </a>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {/* Field Mapping Table */}
@@ -723,13 +863,18 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
                 {!isExcluded ? (
                   <button
                     type="submit"
-                    disabled={!hasExplicitlyApproved || isExecuting || (eligibility?.requiresBackgroundCheckConsent && !bgConsentChecked)}
+                    disabled={!hasExplicitlyApproved || isExecuting || !isDestinationUsable || (eligibility?.requiresBackgroundCheckConsent && !bgConsentChecked)}
                     className="px-6 py-2.5 rounded-xl bg-[#244C3A] hover:bg-[#315D48] text-white text-xs font-semibold transition-all shadow-md cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
                   >
                     {isExecuting ? (
                       <>
                         <Loader2 className="w-4 h-4 animate-spin text-[#D6C49A]" />
                         <span>ApplyPilot Submitting & Verifying...</span>
+                      </>
+                    ) : !isDestinationUsable ? (
+                      <>
+                        <AlertTriangle className="w-4 h-4 text-[#D6C49A]" />
+                        <span>Online Form URL Required</span>
                       </>
                     ) : (
                       <>
