@@ -202,7 +202,7 @@ async function startServer() {
         maxResults: Number(maxResults) || 6
       });
 
-      res.json(searchResult);
+      res.status(searchResult.success ? 200 : 502).json(searchResult);
     } catch (err: any) {
       console.error('[API /api/events/search] Request failed before a search result was returned.');
       res.status(500).json({

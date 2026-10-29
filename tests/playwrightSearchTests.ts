@@ -4,12 +4,15 @@ import type { ReactElement, ReactNode } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import {
   classifyIdealistResultState,
+  detectIdealistPageGate,
   classifyLiveSearchError,
   classifyNavigationError,
   classifySearchResponseStatus,
   isIdealistResultsResponse,
   isRelevantIdealistListing,
   normalizeIdealistListing,
+  selectIdealistSearchLocation,
+  validateTargetUrl,
   waitForIdealistSearchResponse,
   withPlaywrightPage
 } from '../src/server/playwrightService.js';
@@ -38,7 +41,58 @@ async function runTests(): Promise<void> {
   assert.equal(classifyLiveSearchError('Idealist results response timed out', true), 'source_response_timeout');
   assert.equal(classifyLiveSearchError('Matching listing content did not render before the page timed out', true), 'page_render_timeout');
   assert.equal(classifyLiveSearchError('Unexpected page structure', true), 'unexpected_page_structure');
+  assert.equal(detectIdealistPageGate('Access denied. Your request was blocked.'), 'access denied page');
+  assert.equal(detectIdealistPageGate('Please verify that you are human.'), 'robot/CAPTCHA challenge');
+  assert.equal(detectIdealistPageGate('Search for volunteer opportunities'), null);
+  assert.equal((await validateTargetUrl('https://unapproved.example/search')).valid, false);
   console.log('✓ Search navigation and HTTP failure states are distinguished.');
+
+  const fixtureBrowser = await chromium.launch({ headless: true });
+  try {
+    const fixturePage = await fixtureBrowser.newPage();
+    await fixturePage.setContent(`
+      <label for="location">Location</label>
+      <input id="location" role="combobox" aria-label="Location" aria-expanded="false">
+      <div id="suggestions" role="listbox" hidden>
+        <div id="bengaluru" role="option">Bengaluru Karnataka, India</div>
+      </div>
+      <script>
+        const input = document.querySelector('#location');
+        const suggestions = document.querySelector('#suggestions');
+        input.addEventListener('input', () => {
+          suggestions.hidden = !input.value.toLowerCase().includes('bengaluru');
+          input.setAttribute('aria-expanded', String(!suggestions.hidden));
+        });
+        document.querySelector('#bengaluru').addEventListener('click', () => {
+          input.value = 'Bengaluru Karnataka, India';
+          suggestions.hidden = true;
+          input.setAttribute('aria-expanded', 'false');
+        });
+      </script>
+    `);
+    const chosenLocation = await selectIdealistSearchLocation(fixturePage, 'Bengaluru');
+    assert.equal(chosenLocation.selectedLocation, 'Bengaluru Karnataka, India');
+    assert.equal(chosenLocation.selectedSuggestion, 'Bengaluru Karnataka, India');
+
+    await fixturePage.setContent('<main>Volunteer search is temporarily unavailable.</main>');
+    await assert.rejects(
+      selectIdealistSearchLocation(fixturePage, 'Bengaluru', 100),
+      /no visible, enabled Location field/i
+    );
+
+    await fixturePage.setContent(`
+      <label for="location">Location</label>
+      <input id="location" role="combobox" aria-label="Location">
+      <script>document.querySelector('#location').addEventListener('input', () => {});</script>
+    `);
+    await assert.rejects(
+      selectIdealistSearchLocation(fixturePage, 'Bengaluru', 100),
+      /did not offer a location suggestion for "Bengaluru"/i
+    );
+    console.log('✓ Accessible location inputs, suggestion selection, missing fields, and missing suggestions are handled without dropping the requested location.');
+  } finally {
+    await fixtureBrowser.close();
+  }
 
   const validResultResponse = {
     url: () => 'https://www.idealist.org/en/volunteer.data?_routes=search',

@@ -344,6 +344,21 @@ export function classifySearchResponseStatus(status: number): 'success' | 'block
   return 'http_failure';
 }
 
+export function detectIdealistPageGate(
+  bodyText: string
+): 'robot/CAPTCHA challenge' | 'consent gate' | 'access denied page' | null {
+  if (/\b(captcha|verify (that )?you are human|unusual traffic|automated requests)\b/i.test(bodyText)) {
+    return 'robot/CAPTCHA challenge';
+  }
+  if (/\b(consent required|privacy choices required|accept cookies to continue|cookie consent required)\b/i.test(bodyText)) {
+    return 'consent gate';
+  }
+  if (/\b(access denied|request blocked|you have been blocked|temporarily unavailable)\b/i.test(bodyText)) {
+    return 'access denied page';
+  }
+  return null;
+}
+
 export type LiveSearchErrorCode =
   | 'browser_launch_failed'
   | 'navigation_timeout'
@@ -382,6 +397,87 @@ export async function waitForIdealistSearchResponse(
   timeout = 15000
 ): Promise<IdealistResultsResponse> {
   return page.waitForResponse(isIdealistResultsResponse, { timeout });
+}
+
+async function firstVisibleEnabled(
+  candidates: Locator[],
+  timeoutMs: number
+): Promise<Locator | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    for (const candidate of candidates) {
+      const count = await candidate.count().catch(() => 0);
+      for (let index = 0; index < count; index++) {
+        const locator = candidate.nth(index);
+        if (await locator.isVisible().catch(() => false) &&
+            await locator.isEnabled().catch(() => false)) {
+          return locator;
+        }
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 150));
+  }
+  return null;
+}
+
+export async function selectIdealistSearchLocation(
+  page: Page,
+  requestedLocation: string,
+  timeoutMs = 12000
+): Promise<{
+  selectedLocation: string;
+  selectedSuggestion: string;
+  control: {
+    type: string | null;
+    name: string | null;
+    id: string | null;
+    placeholder: string | null;
+    ariaLabel: string | null;
+    role: string | null;
+  };
+}> {
+  const locationInput = await firstVisibleEnabled([
+    page.getByRole('combobox', { name: 'Location', exact: true }),
+    page.locator('#page-header-desktop-search-location'),
+    page.locator('#page-header-mobile-search-location'),
+    page.locator('input[data-qa-id="location-input"]'),
+    page.getByPlaceholder('Everywhere', { exact: true })
+  ], timeoutMs);
+
+  if (!locationInput) {
+    throw new Error('Idealist volunteer search page has no visible, enabled Location field.');
+  }
+
+  const requestedCity = requestedLocation.split(',')[0].trim();
+  await locationInput.fill(requestedLocation);
+  const escapedCity = requestedCity.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const suggestion = await firstVisibleEnabled([
+    page.getByRole('option').filter({ hasText: new RegExp(escapedCity, 'i') })
+  ], timeoutMs);
+
+  if (!suggestion) {
+    throw new Error(`Idealist did not offer a location suggestion for "${sanitizeSearchLocation(requestedLocation)}".`);
+  }
+
+  const suggestionText = (await suggestion.innerText()).replace(/\s+/g, ' ').trim();
+  if (!suggestionText.toLowerCase().includes(requestedCity.toLowerCase())) {
+    throw new Error(`Idealist location suggestion did not match "${sanitizeSearchLocation(requestedLocation)}".`);
+  }
+  await suggestion.click();
+
+  const selectedLocation = (await locationInput.inputValue()).trim();
+  if (!selectedLocation.toLowerCase().includes(requestedCity.toLowerCase())) {
+    throw new Error(`Idealist did not retain the requested location "${sanitizeSearchLocation(requestedLocation)}".`);
+  }
+  const control = await locationInput.evaluate((element) => ({
+    type: element.getAttribute('type'),
+    name: element.getAttribute('name'),
+    id: element.getAttribute('id'),
+    placeholder: element.getAttribute('placeholder'),
+    ariaLabel: element.getAttribute('aria-label'),
+    role: element.getAttribute('role')
+  }));
+  return { selectedLocation, selectedSuggestion: suggestionText, control };
 }
 
 export interface IdealistListingSource {
@@ -468,6 +564,18 @@ export async function searchPublicOpportunities(params: {
     const outcome = await withPlaywrightPage(async (page) => {
       browserLaunched = true;
       logPlaywrightSearch('browser_launched', { location: safeLocation });
+      const consoleErrors: string[] = [];
+      const failedRequests: string[] = [];
+      page.on('console', (message) => {
+        if (message.type() === 'error' && consoleErrors.length < 8) {
+          consoleErrors.push(sanitizeSearchError(message.text()));
+        }
+      });
+      page.on('requestfailed', (request) => {
+        if (failedRequests.length < 8) {
+          failedRequests.push(`${request.method()} ${sanitizeSearchUrl(request.url())}: ${sanitizeSearchError(request.failure()?.errorText || 'request failed')}`);
+        }
+      });
 
       const validation = await validateTargetUrl(searchUrl);
 
@@ -533,7 +641,10 @@ export async function searchPublicOpportunities(params: {
         logPlaywrightSearch('redirect_rejected', {
           location: safeLocation,
           responseStatus,
+          finalUrl: sanitizeSearchUrl(finalUrl),
           pageTitle: sanitizeSearchError(pageTitle),
+          consoleErrors,
+          failedRequests,
           error: sanitizeSearchError(error)
         });
         return {
@@ -554,7 +665,10 @@ export async function searchPublicOpportunities(params: {
         logPlaywrightSearch(blocked ? 'source_blocked' : 'http_failure', {
           location: safeLocation,
           responseStatus,
+          finalUrl: sanitizeSearchUrl(finalUrl),
           pageTitle: sanitizeSearchError(pageTitle),
+          consoleErrors,
+          failedRequests,
           error
         });
         return {
@@ -565,18 +679,18 @@ export async function searchPublicOpportunities(params: {
       }
 
       const bodyText = await page.locator('body').innerText().catch(() => '');
-      const hasSearchForm = await page.locator('form[data-qa-id="search-inputs"]').count() > 0;
-      const hasRobotChallenge = /\b(captcha|verify (that )?you are human|unusual traffic|automated requests)\b/i.test(bodyText);
-      const hasConsentBlock = /\b(consent required|privacy choices required|accept cookies to continue|cookie consent required)\b/i.test(bodyText);
-
-      if (hasRobotChallenge || hasConsentBlock) {
-        const reason = hasRobotChallenge ? 'robot/CAPTCHA challenge' : 'consent gate';
+      const pageGate = detectIdealistPageGate(bodyText);
+      if (pageGate) {
+        const reason = pageGate;
         const error = `The source requires a manual ${reason}; discovery stopped without interacting with the gate.`;
         logPlaywrightSearch('manual_gate_detected', {
           location: safeLocation,
           responseStatus,
           pageTitle: sanitizeSearchError(pageTitle),
-          gate: reason
+          finalUrl: sanitizeSearchUrl(finalUrl),
+          gate: reason,
+          consoleErrors,
+          failedRequests
         });
         return {
           opportunities: [],
@@ -585,79 +699,74 @@ export async function searchPublicOpportunities(params: {
         };
       }
 
-      if (!hasSearchForm) {
-        const error = 'The live page did not contain the observed volunteer search form; its page structure may have changed.';
-        logPlaywrightSearch('unexpected_page_structure', {
-          location: safeLocation,
-          responseStatus,
-          pageTitle: sanitizeSearchError(pageTitle),
-          listingElements: 0,
-          error
-        });
-        return {
-          opportunities: [],
-          sourceSummary: 'Live discovery could not identify the volunteer search form on the source page.',
-          error
-        };
-      }
-
-      const locationInput = page.locator('input[data-qa-id="location-input"]:visible').first();
+      let selectedLocation: string;
+      let locationControl: Awaited<ReturnType<typeof selectIdealistSearchLocation>>['control'];
       try {
-        await locationInput.waitFor({ state: 'visible', timeout: 10000 });
-      } catch {
-        const error = 'The source search form no longer exposes a visible location field.';
-        logPlaywrightSearch('unexpected_search_form', {
-          location: safeLocation,
-          responseStatus,
-          pageTitle: sanitizeSearchError(pageTitle),
-          error
-        });
-        return {
-          opportunities: [],
-          sourceSummary: 'Live discovery could not apply the requested location to the source search.',
-          error
-        };
-      }
-
-      const requestedCity = params.location.split(',')[0].trim();
-      try {
-        await locationInput.fill(params.location);
-        const locationOption = page.getByRole('option').filter({ hasText: requestedCity }).first();
-        await locationOption.waitFor({ state: 'visible', timeout: 10000 });
-        await locationOption.click();
+        const locationResult = await selectIdealistSearchLocation(page, params.location);
+        selectedLocation = locationResult.selectedLocation;
+        locationControl = locationResult.control;
       } catch (locationError) {
-        const error = `The source did not offer a location suggestion for "${safeLocation}": ${sanitizeSearchError(locationError)}`;
+        const formDiagnostics = await page.evaluate(() => {
+          const visible = (element: Element) => Boolean(
+            (element as HTMLElement).offsetWidth ||
+            (element as HTMLElement).offsetHeight ||
+            element.getClientRects().length
+          );
+          return {
+            inputs: Array.from(document.querySelectorAll('input, [role="combobox"]'))
+              .filter(visible)
+              .slice(0, 20)
+              .map((input) => {
+                const element = input as HTMLInputElement;
+                return {
+                  type: element.getAttribute('type'),
+                  name: element.getAttribute('name'),
+                  id: element.id,
+                  placeholder: element.getAttribute('placeholder'),
+                  ariaLabel: element.getAttribute('aria-label'),
+                  role: element.getAttribute('role'),
+                  labels: Array.from(element.labels || []).map((label) => label.innerText).slice(0, 2)
+                };
+              }),
+            searchForms: Array.from(document.querySelectorAll('form'))
+              .filter(visible)
+              .slice(0, 5)
+              .map((form) => ({
+                id: form.id,
+                qaId: form.getAttribute('data-qa-id'),
+                buttons: Array.from(form.querySelectorAll('button'))
+                  .map((button) => ({
+                    text: (button.innerText || '').trim().slice(0, 80),
+                    ariaLabel: button.getAttribute('aria-label'),
+                    qaId: button.getAttribute('data-qa-id')
+                  }))
+                  .slice(0, 8)
+              })),
+            iframeCount: document.querySelectorAll('iframe').length
+          };
+        });
+        const error = `Idealist could not apply the requested location "${safeLocation}": ${sanitizeSearchError(locationError)}`;
         logPlaywrightSearch('location_selection_failed', {
           location: safeLocation,
           responseStatus,
+          finalUrl: sanitizeSearchUrl(page.url()),
           pageTitle: sanitizeSearchError(pageTitle),
+          formDiagnostics,
+          consoleErrors,
+          failedRequests,
           error: sanitizeSearchError(error)
         });
         return {
           opportunities: [],
-          sourceSummary: 'Live discovery could not select the requested location on the source page.',
+          sourceSummary: 'Live discovery could not apply the requested location on Idealist.',
           error
         };
       }
 
-      const selectedLocation = (await locationInput.inputValue().catch(() => '')).trim();
-      if (!selectedLocation.toLowerCase().includes(requestedCity.toLowerCase())) {
-        const error = 'The source did not retain the requested location after selecting its location suggestion.';
-        logPlaywrightSearch('location_selection_unconfirmed', {
-          location: safeLocation,
-          responseStatus,
-          pageTitle: sanitizeSearchError(pageTitle),
-          error
-        });
-        return {
-          opportunities: [],
-          sourceSummary: 'Live discovery could not confirm the requested location in the source search form.',
-          error
-        };
-      }
       logPlaywrightSearch('location_selected', {
         location: safeLocation,
-        selectedLocation: sanitizeSearchLocation(selectedLocation)
+        selectedLocation: sanitizeSearchLocation(selectedLocation),
+        locationControl
       });
 
       const filterCity = params.location.split(',')[0].trim();
@@ -667,10 +776,13 @@ export async function searchPublicOpportunities(params: {
         : normalizedCity === 'bangalore'
           ? ['bangalore', 'bengaluru']
           : [normalizedCity];
-      const searchButton = page.locator('button[data-qa-id="search-button"]:visible').first();
+      const searchButton = await firstVisibleEnabled([
+        page.getByRole('button', { name: 'Search', exact: true }),
+        page.locator('button[data-qa-id="search-button"]')
+      ], 5000);
       let sourceSearchResponse: IdealistResultsResponse | null = null;
       try {
-        if (await searchButton.count() === 0) {
+        if (!searchButton) {
           throw new Error('The source search button is not available.');
         }
         const [response] = await Promise.all([
@@ -720,7 +832,9 @@ export async function searchPublicOpportunities(params: {
           location: safeLocation,
           responseStatus: sourceSearchResponse.status(),
           pageTitle: sanitizeSearchError(await page.title().catch(() => '')),
-          resultHeading: sanitizeSearchError(await page.locator('h2').first().innerText().catch(() => ''))
+          resultHeading: sanitizeSearchError(await page.locator('h2').first().innerText().catch(() => '')),
+          consoleErrors,
+          failedRequests
         });
       } catch (searchError) {
         const message = sanitizeSearchError(searchError);
@@ -823,7 +937,9 @@ export async function searchPublicOpportunities(params: {
         pageTitle: sanitizeSearchError(updatedTitle),
         listingElements: listingCount,
         extractedListings: extracted.length,
-        resultState
+        resultState,
+        consoleErrors,
+        failedRequests
       });
 
       if (resultState === 'extraction_failed' && listingCount === 0) {
