@@ -1,11 +1,44 @@
-import { Opportunity } from '../types';
+import type { BrowserbaseOpportunity, Opportunity } from '../types';
 import { API_BASE_URL } from './supabaseService';
 import { supabase } from '../lib/supabase';
 
 export interface AutoApplyResponse {
   success: boolean;
   error?: string;
+  manualRequired?: boolean;
   alreadyApplied?: boolean;
+  formReview?: {
+    sessionId: string;
+    organization: string;
+    sourceUrl: string;
+    applicationUrl: string;
+    fields: Array<{ id: number; label: string; value: string; required: boolean }>;
+    missingRequiredFields: Array<{
+      id: number;
+      label: string;
+      kind: 'text' | 'select' | 'checkbox' | 'radio' | 'unsupported';
+      message?: string;
+    }>;
+    blockedReason?: string;
+    completedStages: string[];
+    expiresAt: string;
+  };
+  formReviewUpdate?: {
+    fields: Array<{ id: number; label: string; value: string; required: boolean }>;
+    missingRequiredFields: Array<{
+      id: number;
+      label: string;
+      kind: 'text' | 'select' | 'checkbox' | 'radio' | 'unsupported';
+      message?: string;
+    }>;
+  };
+  result?: {
+    submitted: boolean;
+    verified: boolean;
+    evidence: string;
+    applicationUrl: string;
+  };
+  sourceUrl?: string;
   application?: {
     id: string;
     status: string;
@@ -29,6 +62,8 @@ export interface AutoApplyResponse {
   isIneligible?: boolean;
   ineligibilityReason?: string;
 }
+
+export type AutoApplyOpportunity = Opportunity | BrowserbaseOpportunity;
 
 export class AutoApplyRequestError extends Error {
   constructor(
@@ -83,7 +118,64 @@ async function postAutoApply(path: string, body: Record<string, unknown>): Promi
   return payload;
 }
 
-export function prepareAutoApply(opportunity: Opportunity): Promise<AutoApplyResponse> {
+function isLiveListing(opportunity: AutoApplyOpportunity): opportunity is BrowserbaseOpportunity {
+  return 'event_name' in opportunity;
+}
+
+export function isValidLiveListingUrl(value: string | null | undefined): boolean {
+  if (!value) return false;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' &&
+      (url.hostname === 'idealist.org' || url.hostname.endsWith('.idealist.org')) &&
+      /^\/en\/volunteer-opportunity\//.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export function canReviewLiveListing(opportunity: BrowserbaseOpportunity): boolean {
+  return Boolean(
+    (opportunity.title || opportunity.event_name).trim() &&
+    (opportunity.organization || opportunity.organizer_name).trim() &&
+    isValidLiveListingUrl(opportunity.source_url)
+  );
+}
+
+export function hasLiveEligibilityInformation(opportunity: BrowserbaseOpportunity): boolean {
+  return Boolean(
+    opportunity.eligibility?.trim() ||
+    opportunity.required_skills.length > 0 ||
+    opportunity.min_age != null ||
+    opportunity.max_age != null ||
+    opportunity.background_check_required != null
+  );
+}
+
+export function hasStructuredLiveEligibility(opportunity: BrowserbaseOpportunity): boolean {
+  return Boolean(
+    opportunity.required_skills.length > 0 ||
+    opportunity.min_age != null ||
+    opportunity.max_age != null ||
+    opportunity.background_check_required != null
+  );
+}
+
+export async function prepareAutoApply(opportunity: AutoApplyOpportunity): Promise<AutoApplyResponse> {
+  if (isLiveListing(opportunity)) {
+    const destinationUrl = opportunity.source_url;
+    if (!canReviewLiveListing(opportunity) || !destinationUrl) {
+      throw new AutoApplyRequestError(
+        'This live listing cannot be reviewed because its title, organization, or valid Idealist listing URL is missing.'
+      );
+    }
+
+    return postAutoApply('/api/applications/live/review-form', {
+      sourceUrl: destinationUrl,
+      organization: opportunity.organization || opportunity.organizer_name
+    });
+  }
+
   return postAutoApply('/api/applications/prepare', {
     event: {
       id: opportunity.id,
@@ -96,6 +188,21 @@ export function prepareAutoApply(opportunity: Opportunity): Promise<AutoApplyRes
       schedule: opportunity.daysOfWeek
     }
   });
+}
+
+export function fillLiveFormMissingFields(
+  sessionId: string,
+  values: Array<{ id: number; value: string }>
+): Promise<AutoApplyResponse> {
+  return postAutoApply(`/api/applications/live/${encodeURIComponent(sessionId)}/fill-missing`, { values });
+}
+
+export function submitLiveApplication(sessionId: string): Promise<AutoApplyResponse> {
+  return postAutoApply(`/api/applications/live/${encodeURIComponent(sessionId)}/submit`, { confirmed: true });
+}
+
+export function cancelLiveFormReview(sessionId: string): Promise<AutoApplyResponse> {
+  return postAutoApply(`/api/applications/live/${encodeURIComponent(sessionId)}/cancel`, {});
 }
 
 export function approveAutoApply(

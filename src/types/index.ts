@@ -156,6 +156,7 @@ export interface ImpactMetrics {
 export type BrowserbaseVerificationStatus = 'verified_official' | 'community_listed' | 'unverified';
 
 export interface BrowserbaseOpportunity {
+  id?: string;
   // Canonical fields as required by specification
   title: string;
   organization: string;
@@ -175,6 +176,9 @@ export interface BrowserbaseOpportunity {
   registration_deadline: string | null;
   registration_url: string | null;
   source_url: string | null;
+  min_age?: number | null;
+  max_age?: number | null;
+  background_check_required?: boolean | null;
   verification_status: BrowserbaseVerificationStatus;
   match_reason: string;
 }

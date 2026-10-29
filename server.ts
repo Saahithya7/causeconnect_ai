@@ -20,7 +20,11 @@ import {
   isValidIdealistListingUrl,
   validateTargetUrl,
   withPlaywrightPage,
-  standardNGOAdapter
+  standardNGOAdapter,
+  startLiveFormReview,
+  fillMissingLiveFormFields,
+  submitReviewedLiveForm,
+  cancelLiveFormReview
 } from './src/server/playwrightService.js';
 import {
   inspectOpportunityAvailability,
@@ -51,6 +55,14 @@ dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+function getAuthenticatedSupabaseClient(req: AuthenticatedRequest) {
+  const token = req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  if (!token) {
+    throw new Error('Authenticated Supabase access token is required for application data access.');
+  }
+  return createUserSupabaseClient(token);
+}
 
 async function startServer() {
   const app = express();
@@ -216,6 +228,90 @@ async function startServer() {
   // Application workflow endpoints
   // -------------------------------------------------------------
 
+  app.post('/api/applications/live/review-form', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
+    const userId = req.user?.id;
+    const sourceUrl = typeof req.body?.sourceUrl === 'string' ? req.body.sourceUrl.trim() : '';
+    const organization = typeof req.body?.organization === 'string' ? req.body.organization.trim() : '';
+
+    if (!userId) return res.status(401).json({ success: false, error: 'Unauthorized' });
+    if (!sourceUrl || !organization || !isValidIdealistListingUrl(sourceUrl)) {
+      return res.status(400).json({
+        success: false,
+        error: 'A supported volunteer listing URL and organization are required. Open the original listing directly.',
+        sourceUrl
+      });
+    }
+
+    try {
+      const profile = await getProfileByUserId(userId, getAuthenticatedSupabaseClient(req));
+      if (!profile) {
+        return res.status(422).json({
+          success: false,
+          error: 'Your saved volunteer profile could not be loaded. Add your profile details or continue on the source website.',
+          sourceUrl
+        });
+      }
+
+      const formReview = await startLiveFormReview({
+        userId,
+        organization,
+        sourceUrl,
+        profile
+      });
+      return res.json({ success: true, formReview });
+    } catch (error: any) {
+      console.error('[API live form review error]:', error);
+      return res.status(422).json({
+        success: false,
+        manualRequired: true,
+        error: error?.message || 'The application page could not be opened safely.',
+        sourceUrl
+      });
+    }
+  });
+
+  app.post('/api/applications/live/:sessionId/fill-missing', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ success: false, error: 'Unauthorized' });
+
+    const values = req.body?.values;
+    if (!Array.isArray(values) || values.some((item: any) =>
+      !Number.isInteger(item?.id) || typeof item?.value !== 'string'
+    )) {
+      return res.status(400).json({ success: false, error: 'A list of explicit form field values is required.' });
+    }
+
+    try {
+      const formReview = await fillMissingLiveFormFields(req.params.sessionId, userId, values);
+      return res.json({ success: true, formReviewUpdate: formReview });
+    } catch (error: any) {
+      return res.status(422).json({ success: false, error: error?.message || 'Could not fill the requested form fields.' });
+    }
+  });
+
+  app.post('/api/applications/live/:sessionId/submit', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ success: false, error: 'Unauthorized' });
+
+    try {
+      const result = await submitReviewedLiveForm(
+        req.params.sessionId,
+        userId,
+        req.body?.confirmed === true
+      );
+      return res.json({ success: true, result });
+    } catch (error: any) {
+      return res.status(422).json({ success: false, error: error?.message || 'The form could not be submitted.' });
+    }
+  });
+
+  app.post('/api/applications/live/:sessionId/cancel', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
+    const userId = req.user?.id;
+    if (!userId) return res.status(401).json({ success: false, error: 'Unauthorized' });
+    await cancelLiveFormReview(req.params.sessionId, userId);
+    return res.json({ success: true });
+  });
+
   /**
    * POST /api/applications/prepare
    * Pre-flight eligibility screening, missing field detection, and draft preparation
@@ -229,45 +325,128 @@ async function startServer() {
 
       const { event: requestedEvent, userNotes } = req.body || {};
 
-      if (!requestedEvent || typeof requestedEvent.id !== 'string' || !isValidUuid(requestedEvent.id)) {
+      if (!requestedEvent || typeof requestedEvent !== 'object') {
         return res.status(400).json({
           success: false,
-          error: 'A valid persisted event ID is required.'
+          error: 'A valid event payload is required.'
         });
       }
 
-      const { data: eventRow, error: eventError } = await getSupabaseServerClient()
-        .from('opportunities')
-        .select('id, title, organization_name, source_url, min_age, max_age, background_check_required, required_skills')
-        .eq('id', requestedEvent.id)
-        .maybeSingle();
-
-      if (eventError) {
-        throw new Error(`Failed to load the selected opportunity: ${eventError.message}`);
-      }
-      if (!eventRow) {
-        return res.status(404).json({
-          success: false,
-          error: 'This opportunity is no longer available from the trusted event catalog.'
-        });
-      }
-      if (eventRow.background_check_required === null || eventRow.background_check_required === undefined) {
-        return res.status(422).json({
-          success: false,
-          error: 'The event source does not state its background-check requirement. Complete this application manually after checking with the organization.'
-        });
-      }
-
-      const event = {
-        id: String(eventRow.id),
-        title: String(eventRow.title || ''),
-        organization: String(eventRow.organization_name || ''),
-        destinationUrl: String(eventRow.source_url || ''),
-        minAge: typeof eventRow.min_age === 'number' ? eventRow.min_age : undefined,
-        maxAge: typeof eventRow.max_age === 'number' ? eventRow.max_age : undefined,
-        backgroundCheckRequired: eventRow.background_check_required === true,
-        requiredSkills: Array.isArray(eventRow.required_skills) ? eventRow.required_skills : []
+      let event: {
+        id: string;
+        title: string;
+        organization: string;
+        destinationUrl: string;
+        minAge?: number;
+        maxAge?: number;
+        backgroundCheckRequired?: boolean;
+        requiredSkills?: string[];
+        schedule?: string[];
+        applicationDeadline?: string;
       };
+
+      if (requestedEvent.sourceType === 'live_listing') {
+        const title = typeof requestedEvent.title === 'string' ? requestedEvent.title.trim() : '';
+        const organization = typeof requestedEvent.organization === 'string' ? requestedEvent.organization.trim() : '';
+        const destinationUrl = typeof requestedEvent.destinationUrl === 'string' ? requestedEvent.destinationUrl.trim() : '';
+        const missing = [
+          !title && 'event title',
+          !organization && 'organization',
+          !destinationUrl && 'source listing URL'
+        ].filter(Boolean);
+
+        if (missing.length) {
+          return res.status(422).json({
+            success: false,
+            error: `The live listing is missing ${missing.join(', ')}. Continue on the source website instead.`
+          });
+        }
+
+        if (!isValidIdealistListingUrl(destinationUrl)) {
+          return res.status(400).json({
+            success: false,
+            error: 'The live listing URL is not a supported Idealist opportunity page. Continue on the original source website.'
+          });
+        }
+
+        const normalizedDestinationUrl = new URL(destinationUrl).href;
+        const { data: matchingOpportunity, error: matchingOpportunityError } = await getSupabaseServerClient()
+          .from('opportunities')
+          .select('id')
+          .eq('source_url', normalizedDestinationUrl)
+          .maybeSingle();
+
+        if (matchingOpportunityError) {
+          throw new Error(`Failed to match the live listing to a catalog opportunity: ${matchingOpportunityError.message}`);
+        }
+        if (!matchingOpportunity?.id || !isValidUuid(String(matchingOpportunity.id))) {
+          return res.status(422).json({
+            success: false,
+            error: 'This live listing has no matching opportunity in the CauseConnect catalog, so its registration cannot be checked or saved. Continue directly on the original source website.'
+          });
+        }
+
+        event = {
+          id: String(matchingOpportunity.id),
+          title,
+          organization,
+          destinationUrl: normalizedDestinationUrl,
+          minAge: Number.isInteger(requestedEvent.minAge) ? requestedEvent.minAge : undefined,
+          maxAge: Number.isInteger(requestedEvent.maxAge) ? requestedEvent.maxAge : undefined,
+          backgroundCheckRequired: typeof requestedEvent.backgroundCheckRequired === 'boolean'
+            ? requestedEvent.backgroundCheckRequired
+            : undefined,
+          requiredSkills: Array.isArray(requestedEvent.requiredSkills)
+            ? requestedEvent.requiredSkills.filter((skill: unknown): skill is string => typeof skill === 'string')
+            : [],
+          schedule: Array.isArray(requestedEvent.schedule)
+            ? requestedEvent.schedule.filter((day: unknown): day is string => typeof day === 'string')
+            : [],
+          applicationDeadline: typeof requestedEvent.applicationDeadline === 'string'
+            ? requestedEvent.applicationDeadline
+            : undefined
+        };
+      } else {
+        if (typeof requestedEvent.id !== 'string' || !isValidUuid(requestedEvent.id)) {
+          return res.status(400).json({
+            success: false,
+            error: 'A valid persisted event ID is required.'
+          });
+        }
+
+        const { data: eventRow, error: eventError } = await getSupabaseServerClient()
+          .from('opportunities')
+          .select('id, title, organization_name, source_url, min_age, max_age, background_check_required, required_skills')
+          .eq('id', requestedEvent.id)
+          .maybeSingle();
+
+        if (eventError) {
+          throw new Error(`Failed to load the selected opportunity: ${eventError.message}`);
+        }
+        if (!eventRow) {
+          return res.status(404).json({
+            success: false,
+            error: 'This opportunity is no longer available from the trusted event catalog.'
+          });
+        }
+        if (eventRow.background_check_required === null || eventRow.background_check_required === undefined) {
+          return res.status(422).json({
+            success: false,
+            error: 'The event source does not state its background-check requirement. Complete this application manually after checking with the organization.'
+          });
+        }
+
+        event = {
+          id: String(eventRow.id),
+          title: String(eventRow.title || ''),
+          organization: String(eventRow.organization_name || ''),
+          destinationUrl: String(eventRow.source_url || ''),
+          minAge: typeof eventRow.min_age === 'number' ? eventRow.min_age : undefined,
+          maxAge: typeof eventRow.max_age === 'number' ? eventRow.max_age : undefined,
+          backgroundCheckRequired: eventRow.background_check_required === true,
+          requiredSkills: Array.isArray(eventRow.required_skills) ? eventRow.required_skills : []
+        };
+      }
 
       if (!event.title || !event.destinationUrl || !isValidIdealistListingUrl(event.destinationUrl)) {
         return res.status(400).json({
@@ -284,7 +463,12 @@ async function startServer() {
         });
       }
 
-      const result = await prepareApplicationWorkflow(userId, event, { userNotes });
+      const result = await prepareApplicationWorkflow(
+        userId,
+        event,
+        { userNotes },
+        getAuthenticatedSupabaseClient(req)
+      );
 
       if (!result.success) {
         return res.status(result.isIneligible ? 422 : 400).json(result);
@@ -322,7 +506,7 @@ async function startServer() {
         expectedVersion: Number(expectedVersion),
         expectedActionHash: String(expectedActionHash),
         backgroundCheckConsented: Boolean(backgroundCheckConsented)
-      });
+      }, getAuthenticatedSupabaseClient(req));
 
       if (!result.success) {
         return res.status(400).json(result);
@@ -347,7 +531,12 @@ async function startServer() {
         return res.status(401).json({ success: false, error: 'Unauthorized' });
       }
 
-      const result = await executeApplicationWorkflow(applicationId, userId, req.body || {});
+      const result = await executeApplicationWorkflow(
+        applicationId,
+        userId,
+        getAuthenticatedSupabaseClient(req),
+        req.body || {}
+      );
 
       if (!result.success) {
         return res.status(400).json(result);
@@ -368,7 +557,7 @@ async function startServer() {
     try {
       const userId = req.user?.id;
       const applicationId = req.params.applicationId;
-      const appRecord = await getApplicationById(applicationId);
+      const appRecord = await getApplicationById(applicationId, getAuthenticatedSupabaseClient(req));
 
       if (!appRecord) {
         return res.status(404).json({ success: false, error: 'Application not found' });
@@ -396,7 +585,11 @@ async function startServer() {
         return res.status(401).json({ success: false, error: 'Unauthorized' });
       }
 
-      const result = await verifyApplicationWorkflow(applicationId, userId);
+      const result = await verifyApplicationWorkflow(
+        applicationId,
+        userId,
+        getAuthenticatedSupabaseClient(req)
+      );
       if (!result.success) {
         return res.status(500).json(result);
       }

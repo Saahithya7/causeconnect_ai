@@ -11,6 +11,7 @@ import {
   ExternalLink,
   AlertCircle,
   Loader2,
+  Sparkles,
   SlidersHorizontal,
   Info,
   ChevronDown,
@@ -22,10 +23,41 @@ import type {
   VolunteerProfile,
   CauseCategory
 } from '../types';
-import { searchVolunteerOpportunities } from '../services/browserbaseService';
+import { resultsAfterSearch, searchVolunteerOpportunities } from '../services/browserbaseService';
+import { canReviewLiveListing } from '../services/autoApplyService';
+import { AutoApplyModal } from './AutoApplyModal';
 
 interface BrowserbaseFinderProps {
   userProfile?: VolunteerProfile;
+  isAuthenticated: boolean;
+  onPromptSignIn: () => void;
+  onEditProfile: () => void;
+}
+
+export function LiveListingApplyButton({
+  opportunity,
+  onApply
+}: {
+  opportunity: BrowserbaseOpportunity;
+  onApply: (opportunity: BrowserbaseOpportunity) => void;
+}): React.ReactElement {
+  const canApply = canReviewLiveListing(opportunity);
+  return (
+    <button
+      type="button"
+      onClick={() => onApply(opportunity)}
+      disabled={!canApply}
+      title={
+        canApply
+          ? 'Review this live listing and check your profile.'
+          : 'Apply with AI requires a title, organization, and supported Idealist listing URL.'
+      }
+      className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-xl border border-[#244C3A] text-[#244C3A] hover:bg-[#E8F0E9] text-xs font-semibold disabled:opacity-50 disabled:cursor-not-allowed"
+    >
+      <Sparkles className="w-3 h-3" />
+      <span>Apply with AI</span>
+    </button>
+  );
 }
 
 const AVAILABLE_CAUSES: CauseCategory[] = [
@@ -41,7 +73,10 @@ const AVAILABLE_CAUSES: CauseCategory[] = [
 ];
 
 export const BrowserbaseFinder: React.FC<BrowserbaseFinderProps> = ({
-  userProfile
+  userProfile,
+  isAuthenticated,
+  onPromptSignIn,
+  onEditProfile
 }) => {
   // Search parameters
   const [location, setLocation] = useState<string>(userProfile?.city || 'San Francisco, CA');
@@ -63,6 +98,7 @@ export const BrowserbaseFinder: React.FC<BrowserbaseFinderProps> = ({
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [sourceSummary, setSourceSummary] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState<boolean>(false);
+  const [autoApplyListing, setAutoApplyListing] = useState<BrowserbaseOpportunity | null>(null);
 
   const toggleInterest = (cause: string) => {
     setSelectedInterests((prev) =>
@@ -90,13 +126,12 @@ export const BrowserbaseFinder: React.FC<BrowserbaseFinderProps> = ({
         max_results: maxResults
       });
 
-      setResults(response.success ? response.opportunities : []);
+      setResults((currentResults) => resultsAfterSearch(currentResults, response));
       setSourceSummary(response.sourceSummary || response.message || null);
       setErrorMessage(response.success ? null : response.error || 'Live event discovery failed.');
       setHasSearched(true);
     } catch (err: any) {
       setErrorMessage(err?.message || 'Network error executing live Playwright discovery.');
-      setResults([]);
       setHasSearched(true);
     } finally {
       setIsSearching(false);
@@ -443,7 +478,7 @@ export const BrowserbaseFinder: React.FC<BrowserbaseFinderProps> = ({
         <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
           {results.map((opp, idx) => (
             <div
-              key={`${opp.event_name}-${idx}`}
+              key={opp.id || `${opp.event_name}-${idx}`}
               className="bg-white rounded-2xl border border-[#D5E0D7] p-6 shadow-sm hover:shadow-md transition-all flex flex-col justify-between"
             >
               <div className="space-y-3.5">
@@ -518,6 +553,7 @@ export const BrowserbaseFinder: React.FC<BrowserbaseFinderProps> = ({
                 )}
 
                 <div className="flex items-center gap-2 ml-auto">
+                  <LiveListingApplyButton opportunity={opp} onApply={setAutoApplyListing} />
                   {opp.registration_url ? (
                     <a
                       href={opp.registration_url}
@@ -535,6 +571,11 @@ export const BrowserbaseFinder: React.FC<BrowserbaseFinderProps> = ({
                   )}
                 </div>
               </div>
+              {!canReviewLiveListing(opp) && (
+                <p className="mt-2 text-xs text-amber-800" role="note">
+                  Apply with AI is unavailable because this listing is missing a title, organization, or supported source URL. Use View Source to continue manually.
+                </p>
+              )}
             </div>
           ))}
         </div>
@@ -552,6 +593,14 @@ export const BrowserbaseFinder: React.FC<BrowserbaseFinderProps> = ({
           </p>
         </div>
       )}
+      <AutoApplyModal
+        opportunity={autoApplyListing}
+        isOpen={Boolean(autoApplyListing)}
+        isAuthenticated={isAuthenticated}
+        onClose={() => setAutoApplyListing(null)}
+        onPromptSignIn={onPromptSignIn}
+        onEditProfile={onEditProfile}
+      />
     </div>
   );
 };

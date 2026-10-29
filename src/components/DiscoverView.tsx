@@ -29,6 +29,9 @@ interface DiscoverViewProps {
   onSeedOpportunities?: () => Promise<void>;
   isSeeding?: boolean;
   userProfile?: VolunteerProfile;
+  isAuthenticated: boolean;
+  onPromptSignIn: () => void;
+  onEditProfile: () => void;
 }
 
 export const DiscoverView: React.FC<DiscoverViewProps> = ({
@@ -40,7 +43,10 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
   onPublishClick,
   onSeedOpportunities,
   isSeeding = false,
-  userProfile
+  userProfile,
+  isAuthenticated,
+  onPromptSignIn,
+  onEditProfile
 }) => {
   const [activeTab, setActiveTab] = useState<'catalog' | 'browserbase'>('catalog');
   const [selectedCause, setSelectedCause] = useState<string>(initialCauseFilter);
@@ -224,6 +230,9 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
       {activeTab === 'browserbase' ? (
         <BrowserbaseFinder
           userProfile={userProfile}
+          isAuthenticated={isAuthenticated}
+          onPromptSignIn={onPromptSignIn}
+          onEditProfile={onEditProfile}
         />
       ) : (
         <>

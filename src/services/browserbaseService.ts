@@ -13,6 +13,13 @@ export interface BrowserbaseStatusResult {
   message: string;
 }
 
+export function resultsAfterSearch(
+  currentResults: BrowserbaseOpportunity[],
+  response: Pick<BrowserbaseSearchResponse, 'success' | 'opportunities'>
+): BrowserbaseOpportunity[] {
+  return response.success ? response.opportunities : currentResults;
+}
+
 /**
  * Check if Browserbase integration is configured on the server.
  */
@@ -76,6 +83,7 @@ export async function searchVolunteerOpportunities(
     }
 
     const opportunities: BrowserbaseOpportunity[] = (data.opportunities || []).map((item: any) => ({
+      id: item.id,
       title: item.title,
       organization: item.organization || '',
       city: item.city || '',
@@ -89,6 +97,9 @@ export async function searchVolunteerOpportunities(
       event_time: item.time || null,
       location: item.location || null,
       required_skills: item.requiredSkills || [],
+      min_age: item.minAge ?? null,
+      max_age: item.maxAge ?? null,
+      background_check_required: item.backgroundCheckRequired ?? null,
       registration_deadline: item.applicationDeadline || null,
       registration_url: item.applicationUrl || null,
       source_url: item.sourceUrl || null,
@@ -105,7 +116,7 @@ export async function searchVolunteerOpportunities(
       errorCode: data.errorCode,
       message: data.sourceSummary,
       sourceSummary: data.sourceSummary,
-      searched_at: data.checkedAt
+      searched_at: data.searched_at || data.checkedAt
     };
   } catch (err: any) {
     return {

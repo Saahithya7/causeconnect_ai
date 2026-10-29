@@ -1,4 +1,5 @@
 import crypto from 'crypto';
+import type { SupabaseClient } from '@supabase/supabase-js';
 import type {
   VolunteerProfile,
   ApplicationStatus,
@@ -15,14 +16,15 @@ import {
   withPlaywrightPage,
   standardNGOAdapter
 } from './playwrightService.js';
-import { ensureValidUuid } from '../lib/uuidHelper.js';
+import { isValidUuid } from '../lib/uuidHelper.js';
+
+const AUTO_APPLY_DETAILS_KEY = '__causeconnect_auto_apply';
 
 function applicationFromRow(row: Record<string, any>): ApplicationRecord {
-  const dataToSubmit = row.data_to_submit && typeof row.data_to_submit === 'object'
-    ? { ...row.data_to_submit }
+  const approvalDetails = row.approval_details && typeof row.approval_details === 'object'
+    ? row.approval_details
     : {};
-  const workflow = dataToSubmit.__causeconnect_workflow || {};
-  delete dataToSubmit.__causeconnect_workflow;
+  const workflow = approvalDetails[AUTO_APPLY_DETAILS_KEY] || {};
 
   return {
     id: row.id,
@@ -31,120 +33,113 @@ function applicationFromRow(row: Record<string, any>): ApplicationRecord {
     eventTitle: workflow.eventTitle || '',
     organization: workflow.organization || '',
     destinationUrl: workflow.destinationUrl || '',
-    status: row.status as ApplicationStatus,
-    draftVersion: row.draft_version,
-    actionHash: row.action_hash,
-    idempotencyKey: row.idempotency_key,
-    dataToSubmit,
+    status: (workflow.status || row.status) as ApplicationStatus,
+    draftVersion: workflow.draftVersion || 1,
+    actionHash: workflow.actionHash || '',
+    idempotencyKey: workflow.idempotencyKey || '',
+    dataToSubmit: workflow.dataToSubmit || {},
     fieldMapping: workflow.fieldMapping,
     generatedMotivation: workflow.generatedMotivation,
-    approvalTimestamp: row.approval_timestamp || undefined,
-    approvedByUserId: row.approved_by_user_id || undefined,
-    verificationEvidence: row.verification_evidence || undefined,
+    approvalTimestamp: row.user_approved_at || undefined,
+    approvedByUserId: row.user_approved_at ? row.user_id : undefined,
+    verificationEvidence: row.outcome_evidence?.evidence || undefined,
     confirmationReference: row.confirmation_reference || undefined,
-    observedStatus: row.observed_status || undefined,
+    observedStatus: row.outcome_evidence?.observedStatus || undefined,
     lastCheckedAt: workflow.lastCheckedAt || undefined,
-    error: row.error_details || undefined,
+    error: row.error_message || undefined,
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
 }
 
-async function persistApplication(application: ApplicationRecord): Promise<void> {
-  const supabase = getSupabaseServerClient();
-  const { error } = await supabase.from('applications').upsert({
-    id: application.id,
+async function persistApplication(application: ApplicationRecord, client: SupabaseClient): Promise<void> {
+  const { data: existing, error: lookupError } = await client
+    .from('registrations')
+    .select('id, approval_details')
+    .eq('id', application.id)
+    .eq('user_id', application.userId)
+    .maybeSingle();
+
+  if (lookupError) {
+    throw new Error(`Failed to load registration ${application.id}: ${lookupError.message}`);
+  }
+
+  const approvalDetails = existing?.approval_details && typeof existing.approval_details === 'object'
+    ? existing.approval_details
+    : {};
+  const registrationStatus = application.status === 'verified'
+    ? 'confirmed'
+    : application.status === 'waitlisted'
+      ? 'waitlisted'
+      : 'pending_approval';
+  const verifiedOutcome = application.status === 'verified' || application.status === 'waitlisted';
+  if (verifiedOutcome && !application.verificationEvidence?.trim()) {
+    throw new Error('A registration cannot be marked successful without verified source evidence.');
+  }
+  const payload = {
     user_id: application.userId,
     opportunity_id: application.eventId,
-    status: application.status,
-    draft_version: application.draftVersion,
-    action_hash: application.actionHash,
-    idempotency_key: application.idempotencyKey,
-    data_to_submit: {
-      ...application.dataToSubmit,
-      __causeconnect_workflow: {
+    status: registrationStatus,
+    user_approved_at: application.approvalTimestamp || null,
+    approval_details: {
+      ...approvalDetails,
+      [AUTO_APPLY_DETAILS_KEY]: {
+        status: application.status,
         eventTitle: application.eventTitle,
         organization: application.organization,
         destinationUrl: application.destinationUrl,
+        draftVersion: application.draftVersion,
+        actionHash: application.actionHash,
+        idempotencyKey: application.idempotencyKey,
+        dataToSubmit: application.dataToSubmit,
         fieldMapping: application.fieldMapping,
         generatedMotivation: application.generatedMotivation,
         lastCheckedAt: application.lastCheckedAt
       }
     },
-    approval_timestamp: application.approvalTimestamp || null,
-    approved_by_user_id: application.approvedByUserId || null,
-    verification_evidence: application.verificationEvidence || null,
-    confirmation_reference: application.confirmationReference || null,
-    observed_status: application.observedStatus || null,
-    error_details: application.error || null,
-    created_at: application.createdAt,
+    confirmation_reference: verifiedOutcome ? application.confirmationReference || null : null,
+    outcome_evidence: {
+      evidence: application.verificationEvidence || null,
+      observedStatus: application.observedStatus || null
+    },
+    submitted_at: verifiedOutcome ? application.updatedAt : null,
+    confirmed_at: application.status === 'verified' ? application.updatedAt : null,
+    error_message: application.error || null,
     updated_at: application.updatedAt
-  }, { onConflict: 'id' });
+  };
+
+  const { data: saved, error } = existing
+    ? await client.from('registrations').update(payload)
+        .eq('id', application.id)
+        .eq('user_id', application.userId)
+        .select('id')
+        .maybeSingle()
+    : await client.from('registrations').insert({
+        id: application.id,
+        ...payload,
+        created_at: application.createdAt
+      }).select('id').maybeSingle();
 
   if (error) {
-    throw new Error(`Failed to persist application ${application.id}: ${error.message}`);
+    throw new Error(`Failed to persist application review in registrations: ${error.message}`);
+  }
+  if (!saved) {
+    throw new Error(`Registration ${application.id} was not saved for the authenticated user.`);
   }
 }
 
-async function claimApprovedApplication(applicationId: string, userId: string): Promise<ApplicationRecord | null> {
-  const { data, error } = await getSupabaseServerClient()
-    .from('applications')
-    .update({
-      status: 'submitting',
-      updated_at: new Date().toISOString()
-    })
-    .eq('id', applicationId)
-    .eq('user_id', userId)
-    .eq('status', 'approved')
-    .select('*')
-    .maybeSingle();
-
-  if (error) {
-    throw new Error(`Failed to claim the approved application: ${error.message}`);
-  }
-  if (!data) return null;
-
-  const application = applicationFromRow(data);
-  return application;
-}
-
-async function persistVerifiedRegistration(application: ApplicationRecord): Promise<void> {
-  const supabase = getSupabaseServerClient();
-  const opportunityId = ensureValidUuid(application.eventId);
-  const { error: opportunityError } = await supabase.from('opportunities').upsert({
-    id: opportunityId,
-    title: application.eventTitle,
-    organization_name: application.organization,
-    source_url: application.destinationUrl
-  }, { onConflict: 'id' });
-
-  if (opportunityError) {
-    throw new Error(`Failed to persist the verified opportunity: ${opportunityError.message}`);
-  }
-
-  const { error: registrationError } = await supabase.from('registrations').upsert({
-    user_id: application.userId,
-    opportunity_id: opportunityId,
-    status: application.status === 'verified' ? 'confirmed' : 'waitlisted',
-    confirmation_reference: application.confirmationReference || null,
-    submitted_at: application.updatedAt,
-    updated_at: application.updatedAt
-  }, { onConflict: 'user_id,opportunity_id' });
-
-  if (registrationError) {
-    throw new Error(`Failed to persist the verified registration: ${registrationError.message}`);
-  }
-}
-
-export async function getApplicationById(id: string): Promise<ApplicationRecord | null> {
-  const { data, error } = await getSupabaseServerClient()
-    .from('applications')
+export async function getApplicationById(
+  id: string,
+  client: SupabaseClient
+): Promise<ApplicationRecord | null> {
+  const { data, error } = await client
+    .from('registrations')
     .select('*')
     .eq('id', id)
     .maybeSingle();
 
   if (error) {
-    throw new Error(`Failed to load application ${id}: ${error.message}`);
+    throw new Error(`Failed to load registration ${id}: ${error.message}`);
   }
   if (!data) return null;
   const application = applicationFromRow(data);
@@ -241,8 +236,11 @@ export function buildApplyPilotFieldMapping(
 /**
  * Fetch profile from Supabase profiles table
  */
-export async function getProfileByUserId(userId: string): Promise<VolunteerProfile | null> {
-  const { data, error } = await getSupabaseServerClient()
+export async function getProfileByUserId(
+  userId: string,
+  client: SupabaseClient = getSupabaseServerClient()
+): Promise<VolunteerProfile | null> {
+  const { data, error } = await client
     .from('profiles')
     .select('*')
     .eq('user_id', userId)
@@ -351,7 +349,8 @@ export async function prepareApplicationWorkflow(
   },
   options: {
     userNotes?: string;
-  } = {}
+  } = {},
+  client: SupabaseClient
 ): Promise<{
   success: boolean;
   application?: ApplicationRecord;
@@ -364,8 +363,18 @@ export async function prepareApplicationWorkflow(
   ineligibilityReason?: string;
   error?: string;
 }> {
+  if (!isValidUuid(event.id)) {
+    return {
+      success: false,
+      eligibility: null,
+      missingInformation: [],
+      isIneligible: false,
+      error: 'This listing has no matching persisted opportunity UUID. Continue on the original source website; no registration was created.'
+    };
+  }
+
   // 1. Fetch user's saved profile from database
-  const profile = await getProfileByUserId(userId);
+  const profile = await getProfileByUserId(userId, client);
 
   if (!profile) {
     return {
@@ -377,36 +386,27 @@ export async function prepareApplicationWorkflow(
     };
   }
 
-  const { data: existingApplicationRow, error: existingApplicationError } = await getSupabaseServerClient()
-    .from('applications')
+  const { data: existingRegistrationRow, error: existingRegistrationError } = await client
+    .from('registrations')
     .select('*')
     .eq('user_id', userId)
     .eq('opportunity_id', event.id)
     .maybeSingle();
 
-  if (existingApplicationError) {
-    throw new Error(`Failed to check for an existing application: ${existingApplicationError.message}`);
+  if (existingRegistrationError) {
+    throw new Error(`Failed to check existing registrations: ${existingRegistrationError.message}`);
   }
-  const existingApp = existingApplicationRow ? applicationFromRow(existingApplicationRow) : null;
 
-  const { data: registration, error: registrationError } = await getSupabaseServerClient()
-    .from('registrations')
-    .select('id, status')
-    .eq('user_id', userId)
-    .eq('opportunity_id', event.id)
-    .maybeSingle();
-
-  if (registrationError) {
-    throw new Error(`Failed to check existing registrations: ${registrationError.message}`);
-  }
-  if (registration) {
+  const existingWorkflow = existingRegistrationRow?.approval_details?.[AUTO_APPLY_DETAILS_KEY];
+  const existingApp = existingWorkflow ? applicationFromRow(existingRegistrationRow) : null;
+  if (existingRegistrationRow && !existingApp) {
     return {
       success: false,
       alreadyApplied: true,
       eligibility: null,
       missingInformation: [],
       isIneligible: false,
-      error: `A registration already exists for this event (Status: ${registration.status || 'recorded'}). Duplicate attempts are prevented.`
+      error: `A registration already exists for this event (Status: ${existingRegistrationRow.status || 'recorded'}). Duplicate attempts are prevented.`
     };
   }
 
@@ -517,7 +517,7 @@ export async function prepareApplicationWorkflow(
 
   const actionHash = computeActionHash(dataToSubmit);
   const idempotencyKey = generateIdempotencyKey(userId, event.id, draftVersion);
-  const applicationId = existingApp?.id || `app_${crypto.randomUUID().slice(0, 16)}`;
+  const applicationId = existingApp?.id || crypto.randomUUID();
 
   const application: ApplicationRecord = {
     id: applicationId,
@@ -538,7 +538,7 @@ export async function prepareApplicationWorkflow(
   };
 
   try {
-    await persistApplication(application);
+    await persistApplication(application, client);
   } catch (err: any) {
     return {
       success: false,
@@ -570,13 +570,14 @@ export async function approveApplicationWorkflow(
     expectedVersion: number;
     expectedActionHash: string;
     backgroundCheckConsented?: boolean;
-  }
+  },
+  client: SupabaseClient
 ): Promise<{
   success: boolean;
   application?: ApplicationRecord;
   error?: string;
 }> {
-  const application = await getApplicationById(applicationId);
+  const application = await getApplicationById(applicationId, client);
 
   if (!application) {
     return { success: false, error: 'Application record not found.' };
@@ -624,7 +625,7 @@ export async function approveApplicationWorkflow(
   }
 
   try {
-    await persistApplication(approvedApplication);
+    await persistApplication(approvedApplication, client);
   } catch (err: any) {
     return {
       success: false,
@@ -641,6 +642,7 @@ export async function approveApplicationWorkflow(
 export async function executeApplicationWorkflow(
   applicationId: string,
   userId: string,
+  client: SupabaseClient,
   _options: { testMode?: boolean } = {}
 ): Promise<{
   success: boolean;
@@ -648,7 +650,7 @@ export async function executeApplicationWorkflow(
   verificationEvidence?: string;
   error?: string;
 }> {
-  const application = await getApplicationById(applicationId);
+  const application = await getApplicationById(applicationId, client);
 
   if (!application) {
     return { success: false, error: 'Application record not found.' };
@@ -672,45 +674,14 @@ export async function executeApplicationWorkflow(
     };
   }
 
-  const { data: existingRegistration, error: registrationLookupError } = await getSupabaseServerClient()
-    .from('registrations')
-    .select('id, status')
-    .eq('user_id', userId)
-    .eq('opportunity_id', application.eventId)
-    .maybeSingle();
-  if (registrationLookupError) {
+  if (!application.approvalTimestamp) {
     return {
       success: false,
       application,
-      error: `Could not confirm duplicate-registration status: ${registrationLookupError.message}`
+      error: 'Explicit user approval is required before opening the source listing.'
     };
   }
-  if (existingRegistration) {
-    return {
-      success: false,
-      application,
-      error: `A registration already exists for this event (Status: ${existingRegistration.status || 'recorded'}). No application was opened.`
-    };
-  }
-
-  let submittingApplication: ApplicationRecord;
-  try {
-    const claimedApplication = await claimApprovedApplication(applicationId, userId);
-    if (!claimedApplication) {
-      return {
-        success: false,
-        application,
-        error: 'This application has already been claimed or is no longer approved. It will not be submitted twice.'
-      };
-    }
-    submittingApplication = claimedApplication;
-  } catch (err: any) {
-    return {
-      success: false,
-      application,
-      error: err?.message || 'Failed to persist the application execution state.'
-    };
-  }
+  const submittingApplication = application;
 
   try {
     const profile: VolunteerProfile = {
@@ -756,7 +727,7 @@ export async function executeApplicationWorkflow(
       observedStatus: result.status,
       updatedAt: new Date().toISOString()
     };
-    await persistApplication(updatedApplication);
+    await persistApplication(updatedApplication, client);
     const awaitingManualConfirmation = result.status === 'verification_inconclusive';
     return {
       success: !awaitingManualConfirmation,
@@ -773,7 +744,7 @@ export async function executeApplicationWorkflow(
     };
 
     try {
-      await persistApplication(failedApplication);
+      await persistApplication(failedApplication, client);
     } catch (dbError: any) {
       return {
         success: false,
@@ -795,7 +766,8 @@ export async function executeApplicationWorkflow(
  */
 export async function verifyApplicationWorkflow(
   applicationId: string,
-  userId: string
+  userId: string,
+  client: SupabaseClient
 ): Promise<{
   success: boolean;
   application?: ApplicationRecord;
@@ -803,7 +775,7 @@ export async function verifyApplicationWorkflow(
   evidence: string;
   error?: string;
 }> {
-  const application = await getApplicationById(applicationId);
+  const application = await getApplicationById(applicationId, client);
 
   if (!application) {
     return {
@@ -850,10 +822,7 @@ export async function verifyApplicationWorkflow(
     };
 
     try {
-      await persistApplication(updatedApplication);
-      if (verification.verified) {
-        await persistVerifiedRegistration(updatedApplication);
-      }
+      await persistApplication(updatedApplication, client);
     } catch (err: any) {
       const inconclusiveApplication: ApplicationRecord = {
         ...updatedApplication,
@@ -865,7 +834,7 @@ export async function verifyApplicationWorkflow(
       };
 
       try {
-        await persistApplication(inconclusiveApplication);
+        await persistApplication(inconclusiveApplication, client);
       } catch (persistError: any) {
         return {
           success: false,
@@ -901,7 +870,7 @@ export async function verifyApplicationWorkflow(
       updatedAt: new Date().toISOString()
     };
     try {
-      await persistApplication(inconclusiveApplication);
+      await persistApplication(inconclusiveApplication, client);
     } catch (persistError: any) {
       return {
         success: false,

@@ -734,6 +734,9 @@ export default function App() {
               onSeedOpportunities={handleSeedOpportunities}
               isSeeding={isSeeding}
               userProfile={userProfile}
+              isAuthenticated={Boolean(supabaseUserId)}
+              onPromptSignIn={() => setAppMode('signin')}
+              onEditProfile={() => setCurrentDashboardView('profile')}
             />
           )}
 

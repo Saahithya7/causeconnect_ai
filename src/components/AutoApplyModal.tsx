@@ -8,21 +8,31 @@ import {
   Sparkles,
   X
 } from 'lucide-react';
-import { Opportunity } from '../types';
+import type { BrowserbaseOpportunity, Opportunity } from '../types';
 import {
   approveAutoApply,
   AutoApplyRequestError,
   AutoApplyResponse,
+  canReviewLiveListing,
+  cancelLiveFormReview,
   executeAutoApply,
-  prepareAutoApply
+  fillLiveFormMissingFields,
+  hasLiveEligibilityInformation,
+  hasStructuredLiveEligibility,
+  prepareAutoApply,
+  submitLiveApplication
 } from '../services/autoApplyService';
 
 type AutoApplyStage =
   | 'checking'
+  | 'opening'
+  | 'detecting'
+  | 'loading_profile'
+  | 'filling_fields'
   | 'needs_information'
   | 'ready'
   | 'waiting'
-  | 'opening'
+  | 'submitting'
   | 'manual'
   | 'submitted'
   | 'waitlisted'
@@ -30,7 +40,7 @@ type AutoApplyStage =
   | 'already_applied';
 
 interface AutoApplyModalProps {
-  opportunity: Opportunity | null;
+  opportunity: Opportunity | BrowserbaseOpportunity | null;
   isOpen: boolean;
   isAuthenticated: boolean;
   onClose: () => void;
@@ -40,10 +50,14 @@ interface AutoApplyModalProps {
 
 const stageLabels: Record<AutoApplyStage, string> = {
   checking: 'Checking eligibility',
+  opening: 'Opening application page',
+  detecting: 'Detecting form',
+  loading_profile: 'Loading profile',
+  filling_fields: 'Filling fields',
   needs_information: 'Needs more information',
-  ready: 'Ready for review',
+  ready: 'Waiting for user review',
   waiting: 'Waiting for confirmation',
-  opening: 'Opening application',
+  submitting: 'Submitting after your confirmation',
   manual: 'Manual application required',
   submitted: 'Submitted',
   waitlisted: 'Waitlisted',
@@ -57,6 +71,10 @@ function sourceHostname(value: string): string {
   } catch {
     return value;
   }
+}
+
+function isLiveListing(opportunity: Opportunity | BrowserbaseOpportunity): opportunity is BrowserbaseOpportunity {
+  return 'event_name' in opportunity;
 }
 
 export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
@@ -73,15 +91,18 @@ export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
   const [reviewConfirmed, setReviewConfirmed] = useState(false);
   const [backgroundConsent, setBackgroundConsent] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [missingValues, setMissingValues] = useState<Record<number, string>>({});
 
   useEffect(() => {
     if (!isOpen || !opportunity || !isAuthenticated) return;
     let active = true;
-    setStage('checking');
+    const liveListing = isLiveListing(opportunity);
+    setStage(liveListing ? 'opening' : 'checking');
     setResult(null);
     setError(null);
     setReviewConfirmed(false);
     setBackgroundConsent(false);
+    setMissingValues({});
     setBusy(true);
 
     prepareAutoApply(opportunity)
@@ -89,14 +110,25 @@ export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
         if (!active) return;
         setResult(response);
         setBackgroundConsent(Boolean(response.application?.dataToSubmit.backgroundCheckConsented));
-        setStage('ready');
+        if (liveListing && response.formReview) {
+          if (response.formReview.blockedReason) {
+            setError(response.formReview.blockedReason);
+            setStage('manual');
+          } else {
+            setStage(response.formReview.missingRequiredFields.length ? 'needs_information' : 'ready');
+          }
+        } else {
+          setStage('ready');
+        }
       })
       .catch((cause: unknown) => {
         if (!active) return;
         const requestError = cause instanceof AutoApplyRequestError ? cause : null;
         setResult(requestError?.response || null);
         setError(requestError?.message || 'Eligibility could not be checked.');
-        if (requestError?.response?.alreadyApplied) {
+        if (liveListing) {
+          setStage('manual');
+        } else if (requestError?.response?.alreadyApplied) {
           const priorStatus = requestError.response.application?.status;
           if (!priorStatus || priorStatus === 'verified' || priorStatus === 'waitlisted') {
             setStage('already_applied');
@@ -122,20 +154,92 @@ export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
 
   if (!isOpen || !opportunity) return null;
 
+  const liveListing = isLiveListing(opportunity);
+  const title = liveListing ? opportunity.title || opportunity.event_name : opportunity.title;
+  const organization = liveListing
+    ? opportunity.organization || opportunity.organizer_name
+    : opportunity.organization;
+  const location = liveListing ? opportunity.location || opportunity.city : opportunity.location;
+  const sourceUrl = liveListing ? opportunity.source_url || '' : opportunity.sourceUrl;
+  const skills = liveListing ? opportunity.required_skills : opportunity.skills;
+  const description = liveListing ? opportunity.description : opportunity.description;
+  const sourceEligibility = liveListing ? opportunity.eligibility : null;
+  const canPrepare = !liveListing || canReviewLiveListing(opportunity);
+  const liveEligibilityProvided = liveListing && hasLiveEligibilityInformation(opportunity);
+  const liveEligibilityStructured = liveListing && hasStructuredLiveEligibility(opportunity);
+
   const application = result?.application;
   const missingInformation = result?.missingInformation || result?.eligibility?.missingInformation || [];
   const eligibilityReasons = result?.eligibility?.reasons || [];
   const requiresBackgroundConsent = Boolean(result?.eligibility?.requiresBackgroundCheckConsent);
+  const formReview = result?.formReview;
   const canConfirm = Boolean(
     application &&
     application.id &&
     application.actionHash &&
     application.draftVersion &&
+    (!liveListing || liveEligibilityProvided) &&
     reviewConfirmed &&
     (!requiresBackgroundConsent || backgroundConsent)
   );
 
+  const handleFillMissing = async () => {
+    if (!formReview?.sessionId) return;
+    const values = formReview.missingRequiredFields
+      .filter((field) => field.kind === 'text' || field.kind === 'select')
+      .map((field) => ({ id: field.id, value: (missingValues[field.id] || '').trim() }))
+      .filter((field) => field.value.length > 0);
+    if (!values.length) {
+      setError('Enter the missing required details from your own information before continuing.');
+      return;
+    }
+
+    setBusy(true);
+    setStage('filling_fields');
+    setError(null);
+    try {
+      const response = await fillLiveFormMissingFields(formReview.sessionId, values);
+      if (!response.formReviewUpdate) throw new Error('The form service did not return an updated review.');
+      setResult((current) => current?.formReview
+        ? { ...current, formReview: { ...current.formReview, ...response.formReviewUpdate } }
+        : current);
+      setStage(response.formReviewUpdate.missingRequiredFields.length ? 'needs_information' : 'ready');
+      setMissingValues({});
+    } catch (cause: unknown) {
+      const requestError = cause instanceof AutoApplyRequestError ? cause : null;
+      setError(requestError?.message || 'Could not fill those fields.');
+      setStage('needs_information');
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const handleConfirm = async () => {
+    if (liveListing && formReview?.sessionId) {
+      if (!reviewConfirmed || formReview.missingRequiredFields.length) return;
+      setBusy(true);
+      setStage('submitting');
+      setError(null);
+      try {
+        const submission = await submitLiveApplication(formReview.sessionId);
+        setResult((current) => ({ ...submission, formReview: current?.formReview }));
+        if (submission.result?.verified) {
+          setStage('submitted');
+        } else {
+          setStage('manual');
+          setError(submission.result?.evidence || submission.error ||
+            'The organization did not provide verifiable confirmation. Check the source website directly.');
+        }
+      } catch (cause: unknown) {
+        const requestError = cause instanceof AutoApplyRequestError ? cause : null;
+        setError(requestError?.message || 'The organization did not confirm the submission.');
+        setStage('manual');
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+
     if (!application || !canConfirm) return;
     setBusy(true);
     setStage('waiting');
@@ -178,6 +282,17 @@ export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
     }
   };
 
+  const handleClose = async () => {
+    if (formReview?.sessionId && !['submitted', 'waitlisted'].includes(stage)) {
+      try {
+        await cancelLiveFormReview(formReview.sessionId);
+      } catch (cause) {
+        console.warn('[Apply with AI] Could not close the live form session:', cause);
+      }
+    }
+    onClose();
+  };
+
   const statusColor = ['submitted', 'waitlisted'].includes(stage)
     ? 'text-emerald-800 bg-emerald-50 border-emerald-200'
     : ['failed', 'needs_information', 'already_applied', 'manual'].includes(stage)
@@ -202,7 +317,7 @@ export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
               <p className="text-sm text-[#59665C] mt-1">Review eligibility and application details before continuing.</p>
             </div>
           </div>
-          <button onClick={onClose} aria-label="Close application assistant" className="rounded-full p-2 hover:bg-white text-[#244C3A]">
+          <button onClick={handleClose} aria-label="Close application assistant" className="rounded-full p-2 hover:bg-white text-[#244C3A]">
             <X className="w-5 h-5" />
           </button>
         </header>
@@ -216,42 +331,174 @@ export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
           </div>
 
           <div>
-            <p className="text-xs uppercase tracking-wide text-[#59665C] font-semibold">{opportunity.organization}</p>
-            <h3 className="text-lg font-bold mt-1">{opportunity.title}</h3>
+            <p className="text-xs uppercase tracking-wide text-[#59665C] font-semibold">{organization}</p>
+            <h3 className="text-lg font-bold mt-1">{title}</h3>
             <div className="text-sm text-[#59665C] mt-2 space-y-1">
-              <p>{opportunity.location}{opportunity.date ? ` · ${opportunity.date}` : ''}{opportunity.time ? ` · ${opportunity.time}` : ''}</p>
+              <p>{location}{liveListing ? (opportunity.date || opportunity.event_time ? ` · ${opportunity.date || opportunity.event_time}` : '') : `${opportunity.date ? ` · ${opportunity.date}` : ''}${opportunity.time ? ` · ${opportunity.time}` : ''}`}</p>
               <p>
-                Application source:{' '}
-                <a href={opportunity.sourceUrl} target="_blank" rel="noopener noreferrer" className="underline inline-flex items-center gap-1">
-                  {sourceHostname(opportunity.sourceUrl)} <ExternalLink className="w-3 h-3" />
-                </a>
+                Source listing:{' '}
+                {sourceUrl ? (
+                  <a href={sourceUrl} target="_blank" rel="noopener noreferrer" className="underline inline-flex items-center gap-1">
+                    {sourceHostname(sourceUrl)} <ExternalLink className="w-3 h-3" />
+                  </a>
+                ) : <span>Not provided</span>}
               </p>
             </div>
           </div>
 
           <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-950">
-            Automatic form submission is not enabled for this source. CauseConnect will check eligibility and prepare a review, but it will not enter or submit your personal information. Complete the application on the source website.
+            {liveListing
+              ? 'Live listings are not independently verified. CauseConnect can fill matching form fields from your saved profile and show the values for review. It will not submit until you explicitly confirm.'
+              : 'Automatic form submission is not enabled for this source. CauseConnect will check eligibility and prepare a review, but it will not enter or submit your personal information. Complete the application on the source website.'}
           </div>
 
-          {result?.eligibility?.status && (
-            <p className="text-sm"><span className="font-semibold">Eligibility:</span> {result.eligibility.status}</p>
+          {liveListing && formReview && (
+            <div className="rounded-xl border border-[#D5E0D7] p-4 space-y-3">
+              <h4 className="text-sm font-bold">Application form review</h4>
+              <p className="text-xs text-[#59665C]">
+                Form found at{' '}
+                <a href={formReview.applicationUrl} target="_blank" rel="noopener noreferrer" className="underline break-all">
+                  {sourceHostname(formReview.applicationUrl)}
+                </a>
+                . The browser session expires after five minutes.
+              </p>
+              <ol className="text-xs text-[#59665C] list-decimal pl-5">
+                {formReview.completedStages.map((completedStage) => <li key={completedStage}>{completedStage}</li>)}
+              </ol>
+              {formReview.fields.length > 0 && (
+                <dl className="grid grid-cols-1 gap-2 text-sm">
+                  {formReview.fields.map((field) => (
+                    <div key={field.id} className="rounded-lg bg-[#E8F0E9] px-3 py-2">
+                      <dt className="font-semibold">{field.label}{field.required ? ' (required)' : ''}</dt>
+                      <dd className="break-words">{field.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
+              {formReview.missingRequiredFields.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-sm font-semibold">These required fields need your input:</p>
+                  {formReview.missingRequiredFields.map((field) => (
+                    <label key={field.id} className="block text-sm">
+                      <span className="font-medium">{field.label}</span>
+                      {field.message && <span className="block text-xs text-amber-900">{field.message}</span>}
+                      {field.kind === 'text' || field.kind === 'select' ? (
+                        <input
+                          type="text"
+                          value={missingValues[field.id] || ''}
+                          onChange={(event) => setMissingValues((current) => ({ ...current, [field.id]: event.target.value }))}
+                          className="mt-1 w-full rounded-lg border border-[#D5E0D7] px-3 py-2"
+                          autoComplete="off"
+                        />
+                      ) : (
+                        <span className="block mt-1 text-xs text-amber-900">
+                          This control needs direct interaction on the organization’s website; CauseConnect will not set a consent or account-control field.
+                        </span>
+                      )}
+                    </label>
+                  ))}
+                  {formReview.missingRequiredFields.some((field) => field.kind === 'text' || field.kind === 'select') && (
+                    <button
+                      onClick={handleFillMissing}
+                      disabled={busy || !formReview.missingRequiredFields.some((field) =>
+                        (field.kind === 'text' || field.kind === 'select') && Boolean(missingValues[field.id]?.trim())
+                      )}
+                      className="w-full rounded-xl border border-[#244C3A] px-4 py-2 text-sm font-semibold disabled:opacity-50"
+                    >
+                      Fill provided information
+                    </button>
+                  )}
+                </div>
+              )}
+              {stage === 'needs_information' && formReview.missingRequiredFields.some((field) =>
+                field.kind === 'checkbox' || field.kind === 'radio' || field.kind === 'unsupported'
+              ) && (
+                <a
+                  href={sourceUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full rounded-xl border border-[#244C3A] px-4 py-2 text-sm font-semibold flex items-center justify-center gap-2"
+                >
+                  Continue on source website <ExternalLink className="w-4 h-4" />
+                </a>
+              )}
+              {stage === 'submitted' && (
+                <p role="status" className="text-sm font-semibold text-emerald-800">
+                  Submission confirmed: {result?.result?.evidence}
+                </p>
+              )}
+              {stage === 'manual' && result?.result?.evidence && (
+                <p role="status" className="text-sm text-amber-900">{result.result.evidence}</p>
+              )}
+            </div>
           )}
 
-          {opportunity.skills.length > 0 && (
+          {liveListing && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+              <p className="font-semibold">Source-provided eligibility is not independently verified.</p>
+              <p className="mt-1">
+                {sourceEligibility ||
+                  (liveEligibilityProvided
+                    ? 'Eligibility details are available only in the fields listed below.'
+                    : 'Eligibility not provided.')}
+              </p>
+              {opportunity.min_age != null && <p className="mt-1">Minimum age listed: {opportunity.min_age}</p>}
+              {opportunity.max_age != null && <p className="mt-1">Maximum age listed: {opportunity.max_age}</p>}
+              {skills.length > 0 && <p className="mt-1">Required skills listed: {skills.join(', ')}</p>}
+              {opportunity.background_check_required === null || opportunity.background_check_required === undefined
+                ? <p className="mt-1">Background-check requirement: not stated by the listing.</p>
+                : null}
+              {!liveEligibilityProvided && (
+                <p className="mt-2 font-semibold">
+                  CauseConnect cannot check this listing against its eligibility rules because none were provided. Verify the requirements with the organization before continuing.
+                </p>
+              )}
+            </div>
+          )}
+
+          {result?.eligibility?.status && (!liveListing || liveEligibilityStructured) && (
+            <p className="text-sm">
+              <span className="font-semibold">{liveListing ? 'Profile check:' : 'Eligibility:'}</span>{' '}
+              {result.eligibility.status}
+              {liveListing && ' (based only on the information provided; confirm all requirements with the organization)'}
+            </p>
+          )}
+          {liveListing && !liveEligibilityStructured && (
+            <p className="text-sm">
+              <span className="font-semibold">Profile eligibility check:</span> Not available; the listing does not provide structured eligibility criteria.
+            </p>
+          )}
+
+          {description && (
+            <div>
+              <h4 className="text-sm font-bold mb-1">Listing description</h4>
+              <p className="text-sm text-[#59665C]">{description}</p>
+            </div>
+          )}
+
+          {!liveListing && opportunity.skills.length > 0 && (
             <div>
               <h4 className="text-sm font-bold mb-1">Published skills</h4>
               <p className="text-sm text-[#59665C]">{opportunity.skills.join(', ')}</p>
             </div>
           )}
 
-          <p className="text-sm">
-            <span className="font-semibold">Background-check requirement:</span>{' '}
-            {opportunity.backgroundCheck === 'required'
-              ? 'Required'
-              : opportunity.backgroundCheck === 'not-required'
-                ? 'Not required'
-                : 'Not stated'}
-          </p>
+          {!liveListing && (
+            <p className="text-sm">
+              <span className="font-semibold">Background-check requirement:</span>{' '}
+              {opportunity.backgroundCheck === 'required'
+                ? 'Required'
+                : opportunity.backgroundCheck === 'not-required'
+                  ? 'Not required'
+                  : 'Not stated'}
+            </p>
+          )}
+
+          {!canPrepare && (
+            <div role="alert" className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm">
+              This listing cannot be prepared because it is missing a title, organization, or valid supported source URL. Open the source listing manually.
+            </div>
+          )}
 
           {eligibilityReasons.length > 0 && (
             <div className="rounded-xl bg-amber-50 border border-amber-200 p-3">
@@ -271,7 +518,7 @@ export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
             </div>
           )}
 
-          {application && stage === 'ready' && (
+          {application && stage === 'ready' && !liveListing && (
             <div className="rounded-xl border border-[#D5E0D7] p-4 space-y-3">
               <h4 className="text-sm font-bold">Application details to review</h4>
               <dl className="grid grid-cols-2 gap-2 text-sm">
@@ -311,12 +558,14 @@ export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
               Sign in to check eligibility
             </button>
           ) : stage === 'needs_information' ? (
-            <button onClick={onEditProfile} className="w-full rounded-xl bg-[#244C3A] text-white px-4 py-3 text-sm font-semibold">
-              Update volunteer profile
-            </button>
-          ) : stage === 'ready' && application ? (
+            !liveListing && (
+              <button onClick={onEditProfile} className="w-full rounded-xl bg-[#244C3A] text-white px-4 py-3 text-sm font-semibold">
+                Update volunteer profile
+              </button>
+            )
+          ) : stage === 'ready' && (application || (liveListing && formReview)) ? (
             <div className="space-y-3">
-              {requiresBackgroundConsent && (
+              {!liveListing && requiresBackgroundConsent && (
                 <label className="flex items-start gap-2 text-sm">
                   <input type="checkbox" checked={backgroundConsent} onChange={(event) => setBackgroundConsent(event.target.checked)} className="mt-1" />
                   <span>I explicitly consent to the background check required for this opportunity.</span>
@@ -324,14 +573,20 @@ export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
               )}
               <label className="flex items-start gap-2 text-sm">
                 <input type="checkbox" checked={reviewConfirmed} onChange={(event) => setReviewConfirmed(event.target.checked)} className="mt-1" />
-                <span>I reviewed the application details and authorize CauseConnect to continue with this application.</span>
+                <span>
+                  {liveListing
+                    ? 'I reviewed the actual fields and values above and explicitly authorize CauseConnect to submit this application to the organization now.'
+                    : 'I reviewed the application details and authorize CauseConnect to continue with this application.'}
+                </span>
               </label>
               <button
                 onClick={handleConfirm}
-                disabled={!canConfirm || busy}
+                disabled={(liveListing
+                  ? !formReview?.sessionId || formReview.missingRequiredFields.length > 0 || !reviewConfirmed
+                  : !canConfirm) || busy}
                 className="w-full rounded-xl bg-[#244C3A] text-white px-4 py-3 text-sm font-semibold disabled:opacity-50"
               >
-                {busy ? 'Working…' : 'Confirm and continue'}
+                {busy ? stageLabels[stage] : liveListing ? 'Submit application to organization' : 'Confirm and continue'}
               </button>
             </div>
           ) : ['manual', 'failed', 'already_applied'].includes(stage) ? (
@@ -342,7 +597,7 @@ export const AutoApplyModal: React.FC<AutoApplyModalProps> = ({
                 </p>
               )}
               <a
-                href={opportunity.sourceUrl}
+                href={sourceUrl}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="w-full rounded-xl bg-[#244C3A] text-white px-4 py-3 text-sm font-semibold flex items-center justify-center gap-2"

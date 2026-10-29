@@ -9,15 +9,20 @@
  * 6. Supabase database persistence with foreign-key constraints
  */
 import WebSocket from 'ws';
+import assert from 'node:assert/strict';
 if (typeof globalThis !== 'undefined' && typeof (globalThis as any).WebSocket === 'undefined') {
   (globalThis as any).WebSocket = WebSocket;
 }
 
 import {
+  fillMatchingApplicationForm,
+  installApplicationRequestGuard,
   isValidIdealistListingUrl,
   standardNGOAdapter,
-  validateTargetUrl
+  validateTargetUrl,
+  withPlaywrightPage
 } from '../src/server/playwrightService.js';
+import type { VolunteerProfile } from '../src/types/index.js';
 import { parseEventDateTime, detectScheduleConflicts } from '../src/lib/commitMateSchedule.js';
 import {
   prepareRegistrationProposal,
@@ -25,6 +30,7 @@ import {
   executeRegistrationWorkflow,
   evaluateEligibility
 } from '../src/server/registrationAgent.js';
+import { prepareApplicationWorkflow } from '../src/server/applicationWorkflow.js';
 import { createSupabaseRegistration } from '../src/services/supabaseService.js';
 import { createClient } from '@supabase/supabase-js';
 
@@ -156,6 +162,189 @@ async function runAutoApplyTests() {
     passed++;
   } catch (err: any) {
     console.error('  ✗ Test 0 Failed:', err?.message || err);
+    failed++;
+  }
+
+  try {
+    let databaseCalls = 0;
+    const result = await prepareApplicationWorkflow(
+      TEST_USER,
+      {
+        id: 'live-listing-123',
+        title: 'Live volunteer listing',
+        organization: 'Example NGO',
+        destinationUrl: 'https://www.idealist.org/en/volunteer-opportunity/123-example'
+      },
+      {},
+      {
+        from: () => {
+          databaseCalls++;
+          throw new Error('A live listing must not query or write registration rows without a catalog UUID.');
+        }
+      } as any
+    );
+    if (result.success || !/no matching persisted opportunity UUID/i.test(result.error || '') || databaseCalls !== 0) {
+      throw new Error('A live listing without a catalog UUID must be rejected before registration persistence.');
+    }
+    console.log('  ✓ Live listings without a catalog UUID cannot be used as registration opportunity IDs.\n');
+    passed++;
+  } catch (err: any) {
+    console.error('  ✗ Live listing registration-key validation failed:', err?.message || err);
+    failed++;
+  }
+
+  try {
+    const persistedRows: Record<string, any>[] = [];
+    const client = {
+      from(table: string) {
+        if (table === 'profiles') {
+          const query = {
+            select: () => query,
+            eq: () => query,
+            maybeSingle: async () => ({
+              data: {
+                full_name: 'Test Volunteer',
+                email: 'test@example.com',
+                date_of_birth: '1996-01-01',
+                location: 'Bengaluru',
+                skills: [],
+                availability: [],
+                interests: [],
+                background_check_consent: false
+              },
+              error: null
+            })
+          };
+          return query;
+        }
+
+        if (table === 'registrations') {
+          const query = {
+            select: () => query,
+            eq: () => query,
+            maybeSingle: async () => ({ data: null, error: null }),
+            insert: (row: Record<string, any>) => {
+              persistedRows.push(row);
+              return {
+                select: () => ({
+                  maybeSingle: async () => ({ data: { id: row.id }, error: null })
+                })
+              };
+            }
+          };
+          return query;
+        }
+
+        throw new Error(`Unexpected table access: ${table}`);
+      }
+    };
+    const result = await prepareApplicationWorkflow(
+      TEST_USER,
+      {
+        id: '123e4567-e89b-42d3-a456-426614174000',
+        title: 'Catalog volunteer opportunity',
+        organization: 'Example NGO',
+        destinationUrl: 'https://www.idealist.org/en/volunteer-opportunity/123-example',
+        minAge: 18,
+        backgroundCheckRequired: false,
+        requiredSkills: [],
+        schedule: []
+      },
+      {},
+      client as any
+    );
+    const row = persistedRows[0];
+    if (!result.success || !row) {
+      throw new Error(result.error || 'The verified catalog opportunity draft was not saved.');
+    }
+    if (
+      row.opportunity_id !== '123e4567-e89b-42d3-a456-426614174000' ||
+      row.status !== 'pending_approval' ||
+      row.user_approved_at !== null ||
+      row.submitted_at !== null ||
+      row.confirmed_at !== null ||
+      !row.approval_details.__causeconnect_auto_apply ||
+      !row.outcome_evidence ||
+      Object.keys(row).some((key) => ['draft_version', 'action_hash', 'data_to_submit'].includes(key))
+    ) {
+      throw new Error('The review draft did not match the existing registrations schema or approval rules.');
+    }
+    console.log('  ✓ Application drafts use registrations columns and remain pending until approval/verified submission.\n');
+    passed++;
+  } catch (err: any) {
+    console.error('  ✗ Registration-schema persistence failed:', err?.message || err);
+    failed++;
+  }
+
+  try {
+    const profile: VolunteerProfile = {
+      name: 'Alex Volunteer',
+      email: 'alex@example.com',
+      age: 30,
+      phone: '+1 555 0100',
+      educationExperience: 'Two years tutoring students.',
+      city: 'Bengaluru',
+      hasBackgroundCheck: false,
+      preferredCauses: [],
+      skills: ['Tutoring', 'Mentoring'],
+      preferredDays: [],
+      preferredFormat: 'all',
+      maxDistanceMiles: 0,
+      bio: 'I enjoy helping students learn.'
+    };
+    let preview: Awaited<ReturnType<typeof fillMatchingApplicationForm>> | undefined;
+    await withPlaywrightPage(async (page) => {
+      await page.setContent(`
+        <form>
+          <label for="full-name">Full name</label><input id="full-name" name="name" required />
+          <label for="email">Email address</label><input id="email" name="email" type="email" required />
+          <label for="phone">Phone number</label><input id="phone" name="phone" type="tel" />
+          <label for="city">City</label><input id="city" name="city" />
+          <label for="experience">Experience</label><textarea id="experience" name="experience"></textarea>
+          <label for="motivation">Motivation</label><textarea id="motivation" name="motivation"></textarea>
+          <label for="availability">Availability</label><input id="availability" name="availability" required />
+          <button type="submit">Submit application</button>
+        </form>
+        <script>window.submitted = false; document.querySelector('form').addEventListener('submit', () => { window.submitted = true; });</script>
+      `);
+      preview = await fillMatchingApplicationForm(page, profile);
+      assert.equal(await page.locator('#full-name').inputValue(), 'Alex Volunteer');
+      assert.equal(await page.locator('#email').inputValue(), 'alex@example.com');
+      assert.equal(await page.locator('#phone').inputValue(), '+1 555 0100');
+      assert.equal(await page.locator('#city').inputValue(), 'Bengaluru');
+      assert.equal(await page.locator('#experience').inputValue(), 'Two years tutoring students.');
+      assert.equal(await page.locator('#motivation').inputValue(), 'I enjoy helping students learn.');
+      assert.equal(await page.evaluate(() => (window as any).submitted), false);
+    });
+    assert.ok(preview);
+    assert.deepEqual(preview?.missingRequiredFields.map((field) => field.label), ['Availability']);
+    assert.equal(preview?.fields.find((field) => field.label === 'Email address')?.value, 'alex@example.com');
+    console.log('  ✓ Local form fixture filled only saved profile details, reported missing required input, and did not submit.\n');
+    passed++;
+  } catch (err: any) {
+    console.error('  ✗ Local application form fill test failed:', err?.message || err);
+    failed++;
+  }
+
+  try {
+    let blockedBeforeConfirmation = false;
+    await withPlaywrightPage(async (page) => {
+      await page.setContent('<html><body></body></html>');
+      await installApplicationRequestGuard(page, () => false);
+      blockedBeforeConfirmation = await page.evaluate(async () => {
+        try {
+          await fetch('https://example.com/application', { method: 'POST', body: 'test' });
+          return false;
+        } catch {
+          return true;
+        }
+      });
+    });
+    if (!blockedBeforeConfirmation) throw new Error('A form POST was not blocked before explicit approval.');
+    console.log('  ✓ Application form POSTs are blocked until the explicit confirmation gate is enabled.\n');
+    passed++;
+  } catch (err: any) {
+    console.error('  ✗ Pre-confirmation submission guard test failed:', err?.message || err);
     failed++;
   }
 
@@ -530,7 +719,7 @@ async function runAutoApplyTests() {
   }
 
   console.log('======================================================================');
-  console.log(`Auto-Apply Test Results: Passed: ${passed} / 8 | Failed: ${failed} / 8`);
+  console.log(`Auto-Apply Test Results: Passed: ${passed} / 12 | Failed: ${failed} / 12`);
   console.log('======================================================================');
 
   if (failed > 0) {

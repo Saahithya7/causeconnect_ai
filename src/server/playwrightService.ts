@@ -1,4 +1,4 @@
-import { chromium, Browser, BrowserContext, Page } from 'playwright';
+import { chromium, Browser, BrowserContext, Locator, Page } from 'playwright';
 import crypto from 'crypto';
 import dns from 'dns';
 import { isIP } from 'net';
@@ -931,6 +931,542 @@ export interface ApplicationFormAdapter {
     evidence: string;
     observedUrl: string;
   }>;
+}
+
+export interface LiveFormFieldPreview {
+  id: number;
+  label: string;
+  value: string;
+  required: boolean;
+}
+
+export interface LiveMissingFormField {
+  id: number;
+  label: string;
+  kind: 'text' | 'select' | 'checkbox' | 'radio' | 'unsupported';
+  message?: string;
+}
+
+export interface LiveFormReview {
+  sessionId: string;
+  organization: string;
+  sourceUrl: string;
+  applicationUrl: string;
+  fields: LiveFormFieldPreview[];
+  missingRequiredFields: LiveMissingFormField[];
+  blockedReason?: string;
+  completedStages: string[];
+  expiresAt: string;
+}
+
+interface LiveFormSession {
+  userId: string;
+  browser: Browser;
+  context: BrowserContext;
+  page: Page;
+  formIndex: number;
+  profile: VolunteerProfile;
+  organization: string;
+  sourceUrl: string;
+  applicationUrl: string;
+  expiresAt: number;
+  confirmed: boolean;
+  submissionAuthorization: { url: string | null };
+}
+
+const LIVE_FORM_SESSION_TTL_MS = 5 * 60 * 1000;
+const liveFormSessions = new Map<string, LiveFormSession>();
+
+const profileFieldPatterns: Array<{ key: keyof VolunteerProfile; pattern: RegExp }> = [
+  { key: 'name', pattern: /full.?name|legal.?name|your.?name|first.?name|last.?name/ },
+  { key: 'email', pattern: /e.?mail/ },
+  { key: 'phone', pattern: /phone|mobile|telephone/ },
+  { key: 'city', pattern: /city|location|town/ },
+  { key: 'skills', pattern: /skills?|strengths|capabilities/ },
+  { key: 'educationExperience', pattern: /experience|education|background|qualification/ },
+  { key: 'bio', pattern: /motivation|why.*volunteer|interest.*statement|statement.*interest|about.*you/ },
+  { key: 'age', pattern: /\bage\b/ },
+  { key: 'dateOfBirth', pattern: /date.?of.?birth|birth.?date|dob/ }
+];
+
+async function formFieldLabel(field: Locator): Promise<string> {
+  for (const attribute of ['aria-label', 'placeholder', 'name', 'id', 'type']) {
+    const value = await field.getAttribute(attribute);
+    if (value) return value.trim();
+  }
+  return 'Unlabeled field';
+}
+
+function getProfileFieldValue(profile: VolunteerProfile, key: keyof VolunteerProfile): string {
+  const value = profile[key];
+  if (Array.isArray(value)) return value.join(', ');
+  if (typeof value === 'string') return value.trim();
+  if (typeof value === 'number' && value > 0) return String(value);
+  return '';
+}
+
+function matchProfileField(label: string, profile: VolunteerProfile): { key: keyof VolunteerProfile; value: string } | null {
+  const normalized = label.toLowerCase();
+  if (/first\s*(and|&)\s*last/.test(normalized) && profile.name.trim()) {
+    return { key: 'name', value: profile.name.trim() };
+  }
+  if (/first.?name/.test(normalized) && profile.name.trim()) {
+    return { key: 'name', value: profile.name.trim().split(/\s+/)[0] };
+  }
+  if (/last.?name|surname/.test(normalized) && profile.name.trim()) {
+    const parts = profile.name.trim().split(/\s+/);
+    return parts.length > 1 ? { key: 'name', value: parts.slice(1).join(' ') } : null;
+  }
+  for (const candidate of profileFieldPatterns) {
+    if (!candidate.pattern.test(normalized)) continue;
+    if (candidate.key === 'name' && /first.?name|last.?name|surname/.test(normalized)) continue;
+    const value = getProfileFieldValue(profile, candidate.key);
+    if (value) return { key: candidate.key, value };
+  }
+  return null;
+}
+
+function getMissingFieldKind(tag: string, type: string): LiveMissingFormField['kind'] {
+  if (tag === 'select') return 'select';
+  if (type === 'checkbox') return 'checkbox';
+  if (type === 'radio') return 'radio';
+  return ['text', 'email', 'tel', 'number', 'url', 'date', 'search', 'textarea'].includes(
+    type || (tag === 'input' ? 'text' : tag)
+  ) ? 'text' : 'unsupported';
+}
+
+export async function installApplicationRequestGuard(
+  page: Page,
+  isAuthorizedSubmission: (url: string, method: string) => boolean
+): Promise<void> {
+  await page.route('**/*', async (route) => {
+    let url: URL;
+    try {
+      url = new URL(route.request().url());
+    } catch {
+      await route.abort();
+      return;
+    }
+
+    if (url.protocol !== 'https:') {
+      await route.abort('blockedbyclient');
+      return;
+    }
+
+    const method = route.request().method().toUpperCase();
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(method) && !isAuthorizedSubmission(url.href, method)) {
+      await route.abort('blockedbyclient');
+      return;
+    }
+
+    try {
+      if (!(await resolvesOnlyToPublicAddresses(url.hostname.replace(/^\[|\]$/g, '')))) {
+        await route.abort('blockedbyclient');
+        return;
+      }
+      await route.continue();
+    } catch {
+      await route.abort('blockedbyclient');
+    }
+  });
+  await page.addInitScript(() => {
+    document.addEventListener('submit', (event) => {
+      if ((window as any).__causeconnectSubmitConfirmed === true) return;
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }, true);
+  });
+}
+
+export async function fillMatchingApplicationForm(
+  page: Page,
+  profile: VolunteerProfile
+): Promise<{
+  formIndex: number;
+  fields: LiveFormFieldPreview[];
+  missingRequiredFields: LiveMissingFormField[];
+  blockedReason?: string;
+}> {
+  const blockedReason = await page.evaluate(() => {
+    const body = document.body?.innerText || '';
+    if (document.querySelector('iframe[src*="captcha"], .g-recaptcha, [data-sitekey], [class*="captcha" i]')) {
+      return 'A CAPTCHA or bot check is present. Complete the application directly with the organization.';
+    }
+    if (document.querySelector('input[type="password"]') || /\/(login|log-in|signin|sign-in|auth)(\/|$)/i.test(location.pathname)) {
+      return 'The organization requires sign-in. Sign in directly on its website; CauseConnect cannot access or bypass account controls.';
+    }
+    if (/access denied|request blocked|unusual traffic/i.test(body)) {
+      return 'The organization is blocking automated access. Continue directly on its website.';
+    }
+    return '';
+  });
+  if (blockedReason) {
+    return { formIndex: -1, fields: [], missingRequiredFields: [], blockedReason };
+  }
+
+  const forms = page.locator('form');
+  const formCount = await forms.count();
+  let selectedIndex = -1;
+  let selectedScore = -1;
+  for (let index = 0; index < formCount; index++) {
+    const controls = forms.nth(index).locator('input, textarea, select');
+    const count = await controls.count();
+    let score = 0;
+    for (let controlIndex = 0; controlIndex < count; controlIndex++) {
+      const field = controls.nth(controlIndex);
+      if (!(await field.isVisible().catch(() => false))) continue;
+      const type = (await field.getAttribute('type') || '').toLowerCase();
+      if (['hidden', 'submit', 'button', 'reset', 'password', 'file', 'radio', 'checkbox'].includes(type)) continue;
+      const label = `${await formFieldLabel(field)} ${await field.evaluate((element) => {
+        const id = element.getAttribute('id');
+        const explicit = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`)?.textContent : '';
+        return explicit || element.closest('label')?.textContent || '';
+      })}`;
+      if (matchProfileField(label, profile)) score++;
+    }
+    if (count > 0 && score > 0 && score > selectedScore) {
+      selectedIndex = index;
+      selectedScore = score;
+    }
+  }
+
+  if (selectedIndex < 0) {
+    return { formIndex: -1, fields: [], missingRequiredFields: [], blockedReason: 'No application form was found on the organization page.' };
+  }
+
+  const form = forms.nth(selectedIndex);
+  const controls = form.locator('input, textarea, select');
+  const controlCount = await controls.count();
+  const fields: LiveFormFieldPreview[] = [];
+  const missingRequiredFields: LiveMissingFormField[] = [];
+  for (let index = 0; index < controlCount; index++) {
+    const field = controls.nth(index);
+    if (!(await field.isVisible().catch(() => false))) continue;
+    const type = (await field.getAttribute('type') || '').toLowerCase();
+    const tag = await field.evaluate((element) => element.tagName.toLowerCase());
+    const rawLabel = await formFieldLabel(field);
+    const labelText = await field.evaluate((element) => {
+      const id = element.getAttribute('id');
+      const explicit = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`)?.textContent : '';
+      return explicit || element.closest('label')?.textContent || '';
+    });
+    const label = String(labelText || rawLabel).replace(/\s+/g, ' ').trim();
+    const required = (await field.getAttribute('required')) !== null ||
+      (await field.getAttribute('aria-required')) === 'true';
+    const isNonDataControl = ['hidden', 'submit', 'button', 'reset', 'password', 'file', 'radio', 'checkbox'].includes(type);
+    const match = isNonDataControl ? null : matchProfileField(`${label} ${rawLabel}`, profile);
+    let value = '';
+
+    if (match) {
+      value = match.value;
+      if (tag === 'select') {
+        const options = await field.locator('option').evaluateAll((items) => items.map((option) => ({
+          value: (option as HTMLOptionElement).value,
+          label: (option as HTMLOptionElement).label || option.textContent || ''
+        })));
+        const option = options.find((item) => item.label.trim().toLowerCase() === value.toLowerCase()) ||
+          options.find((item) => item.value.trim().toLowerCase() === value.toLowerCase());
+        if (option) {
+          await field.selectOption(option.value);
+        } else {
+          value = '';
+        }
+      } else {
+        await field.fill(value);
+      }
+    }
+
+    if (match && value) {
+      fields.push({ id: index, label, value, required });
+    }
+    const validity = await field.evaluate((element) => ({
+      valid: (element as HTMLInputElement).checkValidity(),
+      message: (element as HTMLInputElement).validationMessage
+    }));
+    if ((required && !value) || !validity.valid) {
+      missingRequiredFields.push({
+        id: index,
+        label,
+        kind: getMissingFieldKind(tag, type),
+        message: validity.message || undefined
+      });
+    }
+  }
+
+  return { formIndex: selectedIndex, fields, missingRequiredFields };
+}
+
+async function disposeLiveFormSession(sessionId: string): Promise<void> {
+  const session = liveFormSessions.get(sessionId);
+  if (!session) return;
+  liveFormSessions.delete(sessionId);
+  await session.page.close().catch(() => {});
+  await session.context.close().catch(() => {});
+  await session.browser.close().catch(() => {});
+}
+
+export async function startLiveFormReview(input: {
+  userId: string;
+  organization: string;
+  sourceUrl: string;
+  profile: VolunteerProfile;
+}): Promise<LiveFormReview> {
+  const sourceValidation = await validateTargetUrl(input.sourceUrl);
+  if (!sourceValidation.valid || !sourceValidation.url) {
+    throw new Error(sourceValidation.reason || 'The source listing URL is not safe to open.');
+  }
+
+  let browser: Browser | null = null;
+  let context: BrowserContext | null = null;
+  let page: Page | null = null;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--no-first-run']
+    });
+    context = await browser.newContext({
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 CauseConnectBot/2.0',
+      viewport: { width: 1280, height: 800 },
+      locale: 'en-US'
+    });
+    page = await context.newPage();
+    page.setDefaultTimeout(10000);
+    page.setDefaultNavigationTimeout(15000);
+
+    const sessionId = crypto.randomUUID();
+    let sessionConfirmed = false;
+    const submissionAuthorization = { url: null as string | null };
+    await installApplicationRequestGuard(
+      page,
+      (url, method) => sessionConfirmed && method === 'POST' && url === submissionAuthorization.url
+    );
+    await page.goto(sourceValidation.url.href, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+    let review = await fillMatchingApplicationForm(page, input.profile);
+    if (review.formIndex < 0) {
+      const anchors = await page.locator('a[href]').evaluateAll((items) => items.map((anchor) => ({
+        href: (anchor as HTMLAnchorElement).href,
+        label: (anchor.textContent || '').replace(/\s+/g, ' ').trim()
+      })));
+      const candidate = anchors.find((anchor) => /apply|register|application|volunteer|sign up/i.test(`${anchor.label} ${anchor.href}`));
+      const fallbackUrl = candidate?.href;
+      if (fallbackUrl) {
+        const target = new URL(fallbackUrl, page.url());
+        if (target.protocol !== 'https:' || target.username || target.password || (target.port && target.port !== '443')) {
+          throw new Error('The linked application page is not a supported secure HTTPS URL. Continue on the source listing.');
+        }
+        if (!(await resolvesOnlyToPublicAddresses(target.hostname))) {
+          throw new Error('The linked application page points to a non-public network address and was blocked.');
+        }
+        await page.goto(target.href, { waitUntil: 'domcontentloaded', timeout: 15000 });
+        review = await fillMatchingApplicationForm(page, input.profile);
+      }
+    }
+
+    if (review.formIndex < 0) {
+      const applicationUrl = page.url();
+      await page.close().catch(() => {});
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+      page = null;
+      context = null;
+      browser = null;
+      return {
+        sessionId: '',
+        organization: input.organization,
+        sourceUrl: sourceValidation.url.href,
+        applicationUrl,
+        fields: [],
+        missingRequiredFields: [],
+        blockedReason: review.blockedReason || 'No supported application form was found. Continue on the organization’s page.',
+        completedStages: ['Loading profile', 'Opening application page', 'Detecting form'],
+        expiresAt: new Date().toISOString()
+      };
+    }
+
+    const expiresAt = Date.now() + LIVE_FORM_SESSION_TTL_MS;
+    const session: LiveFormSession = {
+      userId: input.userId,
+      browser,
+      context,
+      page,
+      formIndex: review.formIndex,
+      profile: input.profile,
+      organization: input.organization,
+      sourceUrl: sourceValidation.url.href,
+      applicationUrl: page.url(),
+      expiresAt,
+      confirmed: false,
+      submissionAuthorization
+    };
+    liveFormSessions.set(sessionId, session);
+    const timer = setTimeout(() => { void disposeLiveFormSession(sessionId); }, LIVE_FORM_SESSION_TTL_MS);
+    timer.unref?.();
+
+    return {
+      sessionId,
+      organization: input.organization,
+      sourceUrl: sourceValidation.url.href,
+      applicationUrl: page.url(),
+      fields: review.fields,
+      missingRequiredFields: review.missingRequiredFields,
+      blockedReason: review.blockedReason,
+      completedStages: [
+        'Loading profile',
+        'Opening application page',
+        'Detecting form',
+        ...(review.formIndex >= 0 ? ['Filling fields'] : [])
+      ],
+      expiresAt: new Date(expiresAt).toISOString()
+    };
+  } catch (error) {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+    throw error;
+  }
+}
+
+export async function fillMissingLiveFormFields(
+  sessionId: string,
+  userId: string,
+  values: Array<{ id: number; value: string }>
+): Promise<Pick<LiveFormReview, 'fields' | 'missingRequiredFields'>> {
+  const session = liveFormSessions.get(sessionId);
+  if (!session || session.userId !== userId || session.expiresAt <= Date.now()) {
+    await disposeLiveFormSession(sessionId);
+    throw new Error('The form review session has expired. Start Apply with AI again.');
+  }
+  if (session.formIndex < 0) throw new Error('No supported application form was detected.');
+
+  const controls = session.page.locator('form').nth(session.formIndex).locator('input, textarea, select');
+  for (const item of values) {
+    if (!Number.isInteger(item.id) || item.id < 0 || item.id >= await controls.count() || typeof item.value !== 'string' || item.value.length > 2000) {
+      throw new Error('A supplied form value is invalid.');
+    }
+    const field = controls.nth(item.id);
+    const type = (await field.getAttribute('type') || '').toLowerCase();
+    if (['hidden', 'submit', 'button', 'reset', 'password', 'file', 'radio', 'checkbox'].includes(type)) {
+      throw new Error('This required field needs direct interaction on the source website.');
+    }
+    if ((await field.evaluate((element) => element.tagName.toLowerCase())) === 'select') {
+      const options = await field.locator('option').evaluateAll((items) => items.map((option) => ({
+        value: (option as HTMLOptionElement).value,
+        label: (option as HTMLOptionElement).label || option.textContent || ''
+      })));
+      const option = options.find((entry) => entry.label.trim().toLowerCase() === item.value.trim().toLowerCase()) ||
+        options.find((entry) => entry.value.trim().toLowerCase() === item.value.trim().toLowerCase());
+      if (option) await field.selectOption(option.value);
+    } else {
+      await field.fill(item.value);
+    }
+  }
+
+  const controlsCount = await controls.count();
+  const fields: LiveFormFieldPreview[] = [];
+  const missingRequiredFields: LiveMissingFormField[] = [];
+  for (let id = 0; id < controlsCount; id++) {
+    const field = controls.nth(id);
+    if (!(await field.isVisible().catch(() => false))) continue;
+    const labelText = await field.evaluate((element) => {
+      const id = element.getAttribute('id');
+      const explicit = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`)?.textContent : '';
+      return explicit || element.closest('label')?.textContent || '';
+    });
+    const label = String(labelText || await formFieldLabel(field)).replace(/\s+/g, ' ').trim();
+    const required = (await field.getAttribute('required')) !== null ||
+      (await field.getAttribute('aria-required')) === 'true';
+    const type = (await field.getAttribute('type') || '').toLowerCase();
+    const value = ['checkbox', 'radio', 'file', 'password'].includes(type)
+      ? ''
+      : await field.inputValue().catch(() => '');
+    const validity = await field.evaluate((element) => ({
+      valid: (element as HTMLInputElement).checkValidity(),
+      message: (element as HTMLInputElement).validationMessage
+    }));
+    if (value) fields.push({ id, label, value, required });
+    if ((required && !value) || !validity.valid) {
+      const tag = await field.evaluate((element) => element.tagName.toLowerCase());
+      missingRequiredFields.push({
+        id,
+        label,
+        kind: getMissingFieldKind(tag, type),
+        message: validity.message || undefined
+      });
+    }
+  }
+  return { fields, missingRequiredFields };
+}
+
+export async function submitReviewedLiveForm(
+  sessionId: string,
+  userId: string,
+  explicitlyConfirmed: boolean
+): Promise<{ submitted: boolean; verified: boolean; evidence: string; applicationUrl: string }> {
+  const session = liveFormSessions.get(sessionId);
+  if (!session || session.userId !== userId || session.expiresAt <= Date.now()) {
+    await disposeLiveFormSession(sessionId);
+    throw new Error('The form review session has expired. Start Apply with AI again.');
+  }
+  if (!explicitlyConfirmed) throw new Error('Explicit confirmation is required before submitting this form.');
+  if (session.formIndex < 0) throw new Error('No supported application form was detected.');
+
+  const { missingRequiredFields, blockedReason } = await fillMatchingApplicationForm(session.page, session.profile);
+  if (blockedReason) throw new Error(blockedReason);
+  if (missingRequiredFields.length) {
+    throw new Error(`Required fields are missing or need direct user input: ${missingRequiredFields.map((field) => field.label).join(', ')}`);
+  }
+
+  const form = session.page.locator('form').nth(session.formIndex);
+  const method = (await form.getAttribute('method') || 'get').toLowerCase();
+  if (method !== 'post') {
+    throw new Error('This form does not use a secure POST submission. CauseConnect will not place your details in a URL; complete it directly on the organization’s website.');
+  }
+  const rawAction = await form.getAttribute('action');
+  const actionUrl = new URL(rawAction || session.page.url(), session.page.url());
+  if (actionUrl.protocol !== 'https:' || actionUrl.username || actionUrl.password || (actionUrl.port && actionUrl.port !== '443')) {
+    throw new Error('The form action is not a supported secure HTTPS URL. Continue on the organization’s website.');
+  }
+  if (!(await resolvesOnlyToPublicAddresses(actionUrl.hostname))) {
+    throw new Error('The form action points to a non-public network address and was blocked.');
+  }
+  session.submissionAuthorization.url = actionUrl.href;
+  session.confirmed = true;
+  await session.page.evaluate(() => { (window as any).__causeconnectSubmitConfirmed = true; });
+  const submissionResponse = session.page.waitForResponse((response) =>
+    response.request().method().toUpperCase() === 'POST' && response.url() === actionUrl.href,
+  { timeout: 15000 }).catch(() => null);
+  await form.evaluate((element: HTMLFormElement) => element.requestSubmit());
+  const response = await submissionResponse;
+  if (!response) {
+    await disposeLiveFormSession(sessionId);
+    return {
+      submitted: false,
+      verified: false,
+      evidence: 'The organization did not return a response to the form submission. Check the source website before trying again.',
+      applicationUrl: session.page.url()
+    };
+  }
+  await session.page.waitForTimeout(500).catch(() => {});
+  const applicationUrl = session.page.url();
+  const bodyText = await session.page.locator('body').innerText().catch(() => '');
+  const confirmation = response.ok() &&
+    /\b(thank you for (applying|registering)|application (has been |was )?(successfully )?(submitted|received)|registration (has been |was )?(successfully )?(submitted|received|confirmed)|successfully applied)\b/i.test(bodyText);
+  const result = {
+    submitted: confirmation,
+    verified: confirmation,
+    evidence: confirmation
+      ? 'The organization displayed a submission confirmation after the explicitly approved form submission.'
+      : 'The form was submitted after explicit confirmation, but the organization did not display a recognizable confirmation. Verify the outcome directly with the organization.',
+    applicationUrl
+  };
+  await disposeLiveFormSession(sessionId);
+  return result;
+}
+
+export async function cancelLiveFormReview(sessionId: string, userId: string): Promise<void> {
+  const session = liveFormSessions.get(sessionId);
+  if (session?.userId === userId) await disposeLiveFormSession(sessionId);
 }
 
 /**
