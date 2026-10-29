@@ -197,10 +197,12 @@ export interface BrowserbaseSearchResponse {
   status?: string;
   opportunities: BrowserbaseOpportunity[];
   error?: string;
+  errorCode?: string;
   message?: string;
   instructions?: string;
   searched_at?: string;
   source_count?: number;
+  sourceSummary?: string;
 }
 
 // -------------------------------------------------------------------
@@ -528,4 +530,3 @@ export interface WaitlistInspectionResult {
   isBlockedOrCaptcha?: boolean;
   blockReason?: string;
 }
-

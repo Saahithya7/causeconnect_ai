@@ -92,11 +92,17 @@ export function evaluateEligibility(
   // 1. Age Resolution & Deterministic Rule Check
   let calculatedAge = volunteer.age;
   if (!calculatedAge && volunteer.dateOfBirth) {
-    const dob = new Date(volunteer.dateOfBirth);
-    if (!isNaN(dob.getTime())) {
-      const diffMs = Date.now() - dob.getTime();
-      const ageDt = new Date(diffMs);
-      calculatedAge = Math.abs(ageDt.getUTCFullYear() - 1970);
+    const dob = new Date(`${volunteer.dateOfBirth}T00:00:00`);
+    if (!Number.isNaN(dob.getTime())) {
+      const today = new Date();
+      let age = today.getFullYear() - dob.getFullYear();
+      if (
+        today.getMonth() < dob.getMonth() ||
+        (today.getMonth() === dob.getMonth() && today.getDate() < dob.getDate())
+      ) {
+        age--;
+      }
+      calculatedAge = age >= 0 ? age : 0;
     }
   }
 
@@ -153,9 +159,7 @@ export function evaluateEligibility(
     opportunity.backgroundCheck === 'required' ||
     opportunity.backgroundCheck === 'not-confirmed';
 
-  const hasConsent =
-    volunteer.backgroundCheckConsent === true ||
-    volunteer.hasBackgroundCheck === true;
+  const hasConsent = volunteer.backgroundCheckConsent === true;
 
   if (needsBackgroundCheck) {
     rulesEvaluated.push({
@@ -167,16 +171,21 @@ export function evaluateEligibility(
         : 'Event requires background check, but volunteer has not yet provided explicit consent.'
     });
 
-    if (!hasConsent) {
-      reasons.push('Mandatory background check consent has not been provided.');
-    }
   }
 
   // 3. Schedule / Weekend Availability Check
   const eventDays = opportunity.daysOfWeek || opportunity.schedule || [];
   const volunteerDays = volunteer.preferredDays || volunteer.availability || [];
 
-  if (eventDays.length > 0 && volunteerDays.length > 0) {
+  if (eventDays.length > 0 && volunteerDays.length === 0) {
+    missingInformation.push('Availability for the event schedule');
+    rulesEvaluated.push({
+      rule: 'SCHEDULE_AVAILABILITY_MATCH',
+      passed: false,
+      deterministic: true,
+      details: 'Event schedule is published, but volunteer availability has not been provided.'
+    });
+  } else if (eventDays.length > 0) {
     const hasOverlap = eventDays.some((d) =>
       volunteerDays.some((vd) => vd.toLowerCase().includes(d.toLowerCase()) || d.toLowerCase().includes(vd.toLowerCase()))
     );
@@ -274,9 +283,9 @@ export function evaluateEligibility(
   let status: 'Eligible' | 'Ineligible' | 'Needs more information' | 'Awaiting consent';
 
   // Hard Age Disqualification
-  if (calculatedAge !== undefined && minAge > 0 && calculatedAge < minAge) {
+  if (calculatedAge !== undefined && calculatedAge > 0 && minAge > 0 && calculatedAge < minAge) {
     status = 'Ineligible';
-  } else if (calculatedAge !== undefined && maxAge > 0 && calculatedAge > maxAge) {
+  } else if (calculatedAge !== undefined && calculatedAge > 0 && maxAge > 0 && calculatedAge > maxAge) {
     status = 'Ineligible';
   } else if (missingInformation.length > 0) {
     status = 'Needs more information';
@@ -303,7 +312,7 @@ export function evaluateEligibility(
     outcomeExplanation = 'This position requires explicit volunteer background check authorization.';
   } else {
     applyPilotStatus = 'eligible';
-    outcomeExplanation = 'Volunteer meets all published age, schedule, skill, and location criteria.';
+    outcomeExplanation = 'No published hard eligibility failures were found from the available profile and event data. Review any non-deterministic criteria before continuing.';
   }
 
   return {
@@ -527,7 +536,7 @@ export function recordProposalApproval(
  * Enforces:
  * 1. Pre-execution approval validation (action hash, version, consent)
  * 2. Idempotency check (prevents double submissions)
- * 3. Safe browser automation via Browserbase or test-mode automation
+ * 3. Playwright navigation without automatic form submission; fixtures run only in test mode
  * 4. Independent post-submission verification
  */
 export async function executeRegistrationWorkflow(
@@ -689,13 +698,13 @@ export async function executeRegistrationWorkflow(
   logStep('SUBMISSION_DISPATCH', 'ok', `Submitting approved registration payload to ${proposal.destinationDomain}`);
 
   // 5. Execution: Test Mode or Live Browser Automation
-  let confirmationReference = '';
+  let confirmationReference: string | undefined;
   let sanitizedEvidence = '';
-  let observedStatus: 'confirmed' | 'waitlisted' | 'pending' | 'failed' = 'confirmed';
+  let observedStatus: 'confirmed' | 'waitlisted' | 'pending' | 'failed' = 'pending';
   let observedUrl = proposal.destinationUrl;
 
-  const isTestMode = executionOptions?.testMode || proposal.destinationUrl.includes('test') || proposal.opportunityId.startsWith('test-');
-  const isSimulatedWaitlist = executionOptions?.simulatedWaitlist;
+  const isTestMode = process.env.NODE_ENV === 'test' && executionOptions?.testMode === true;
+  const isSimulatedWaitlist = isTestMode && executionOptions?.simulatedWaitlist === true;
 
   if (isTestMode) {
     // Isolated Controlled Test Runner
@@ -749,10 +758,22 @@ export async function executeRegistrationWorkflow(
       }, { timeoutMs: 15000 });
 
       observedUrl = pwResult.observedUrl;
-      confirmationReference = pwResult.confirmationReference || `PW-${Math.floor(10000 + Math.random() * 90000)}`;
-      observedStatus = pwResult.status === 'waitlisted' ? 'waitlisted' : 'confirmed';
+      confirmationReference = pwResult.confirmationReference;
+      observedStatus = pwResult.status === 'verified'
+        ? 'confirmed'
+        : pwResult.status === 'waitlisted'
+          ? 'waitlisted'
+          : pwResult.status === 'failed'
+            ? 'failed'
+            : 'pending';
       sanitizedEvidence = pwResult.evidenceText;
-      logStep('PLAYWRIGHT_ACTION_COMPLETE', 'ok', `Playwright automated submission executed successfully with status ${observedStatus}`);
+      logStep(
+        'PLAYWRIGHT_DESTINATION_OPENED',
+        observedStatus === 'pending' ? 'warning' : 'ok',
+        observedStatus === 'pending'
+          ? 'Destination opened; no personal information was submitted and manual confirmation is required.'
+          : `A destination response was observed with status ${observedStatus}.`
+      );
     } catch (pwErr: any) {
       logStep('PLAYWRIGHT_EXECUTION_FAILED', 'error', `Playwright execution error: ${pwErr?.message || 'Automation submission failed'}`);
       entry.state = 'failed';
@@ -762,6 +783,7 @@ export async function executeRegistrationWorkflow(
       return {
         success: false,
         state: 'failed',
+        proposal,
         error: pwErr?.message || 'Playwright automated form submission could not be completed on destination website.',
         actionTrace,
         verificationResult: {
@@ -789,7 +811,7 @@ export async function executeRegistrationWorkflow(
     registrationId: proposalId,
     observedSourceUrl: observedUrl,
     confirmationReference,
-    sanitizedEvidence: executionOptions?.customEvidence || sanitizedEvidence,
+    sanitizedEvidence: isTestMode ? executionOptions?.customEvidence || sanitizedEvidence : sanitizedEvidence,
     verifiedAt: new Date().toISOString(),
     mismatches
   };
@@ -802,11 +824,14 @@ export async function executeRegistrationWorkflow(
   logStep('VERIFICATION_COMPLETE', observedStatus === 'confirmed' ? 'ok' : 'warning', `Final verified status: ${entry.state}`);
 
   return {
-    success: true,
+    success: observedStatus === 'confirmed' || observedStatus === 'waitlisted',
     state: entry.state,
     proposal,
     verificationResult,
-    actionTrace
+    actionTrace,
+    ...(observedStatus === 'pending' && {
+      error: 'No application was submitted automatically. Complete registration with the organization and request verification afterward.'
+    })
   };
 }
 

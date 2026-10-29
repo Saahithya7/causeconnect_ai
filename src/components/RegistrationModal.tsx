@@ -96,7 +96,7 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
   const [submittedRegistration, setSubmittedRegistration] = useState<Registration | null>(null);
 
   // Missing info prompt state
-  const [volunteerAge, setVolunteerAge] = useState<number>(userProfile.age || 21);
+  const [volunteerAge, setVolunteerAge] = useState<number>(userProfile.age || 0);
   const [volunteerDob, setVolunteerDob] = useState<string>(userProfile.dateOfBirth || '');
   const [volunteerPhone, setVolunteerPhone] = useState<string>(userProfile.phone || '');
 
@@ -136,13 +136,15 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
   useEffect(() => {
     if (isOpen && opportunity) {
       // Generate initial motivation statement
-      const skillsStr = userProfile.skills?.length
-        ? userProfile.skills.slice(0, 3).join(', ')
-        : 'community collaboration';
-      const causeStr = userProfile.preferredCauses?.length
-        ? userProfile.preferredCauses[0]
-        : 'social good';
-      const generated = `I am excited to apply for ${opportunity.title} with ${opportunity.organization}. With practical skills in ${skillsStr} and a passion for ${causeStr}, I look forward to contributing to your mission in ${userProfile.city || 'the community'}.`;
+      const profileDetails = [
+        userProfile.skills?.length ? `My profile lists these skills: ${userProfile.skills.slice(0, 3).join(', ')}.` : '',
+        userProfile.preferredCauses?.length ? `I am interested in ${userProfile.preferredCauses[0]}.` : '',
+        userProfile.city ? `I am based in ${userProfile.city}.` : ''
+      ].filter(Boolean);
+      const generated = [
+        `I am interested in applying for ${opportunity.title} with ${opportunity.organization}.`,
+        ...profileDetails
+      ].join(' ');
       setTailoredMotivation(generated);
       if (!userNotes) {
         setUserNotes(generated);
@@ -225,6 +227,7 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
 
     setIsExecuting(true);
     setExecutionError(null);
+    window.open(destinationUrl, '_blank', 'noopener,noreferrer');
 
     try {
       // 1. Record explicit user approval on backend (locks version & action hash)
@@ -241,7 +244,18 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
 
       // 2. Execute registration workflow with independent Playwright verification
       const execRes = await executeRegistration(proposal.proposalId);
-      if (!execRes.success || !execRes.verificationResult) {
+      if (!execRes.verificationResult) {
+        throw new Error(execRes.error || 'Registration execution could not be verified by destination portal.');
+      }
+
+      if (execRes.verificationResult.status === 'pending' || execRes.state === 'pending_verification') {
+        setExecutionError(
+          'Application is awaiting confirmation. CauseConnect did not enter or submit your personal information. Open the organization page above, complete any required login, CAPTCHA, consent, or application steps there, then check for its confirmation.'
+        );
+        return;
+      }
+
+      if (!execRes.success) {
         throw new Error(execRes.error || 'Registration execution could not be verified by destination portal.');
       }
 
@@ -300,10 +314,10 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
     { label: 'Full Legal Name', value: userProfile.name, formField: 'input[name="name"]', status: userProfile.name ? 'mapped' : 'missing' },
     { label: 'Email Address', value: userProfile.email, formField: 'input[name="email"]', status: userProfile.email?.includes('@') ? 'mapped' : 'missing' },
     { label: 'Phone Number', value: volunteerPhone || userProfile.phone || 'Not provided', formField: 'input[name="phone"]', status: (volunteerPhone || userProfile.phone) ? 'mapped' : 'optional' },
-    { label: 'Verified Age', value: `${volunteerAge} years`, formField: 'input[name="age"]', status: volunteerAge ? 'mapped' : 'missing' },
-    { label: 'City & Location', value: userProfile.city || 'Local Area', formField: 'input[name="city"]', status: 'mapped' },
-    { label: 'Skills & Qualifications', value: userProfile.skills?.join(', ') || 'General volunteer', formField: 'input[name="skills"]', status: 'mapped' },
-    { label: 'Schedule Availability', value: userProfile.preferredDays?.join(', ') || 'Flexible', formField: 'select[name="availability"]', status: 'mapped' },
+    { label: 'Verified Age', value: volunteerAge > 0 ? `${volunteerAge} years` : 'Not provided', formField: 'input[name="age"]', status: volunteerAge > 0 ? 'mapped' : 'missing' },
+    { label: 'City & Location', value: userProfile.city || 'Not provided', formField: 'input[name="city"]', status: userProfile.city ? 'mapped' : 'optional' },
+    { label: 'Skills & Qualifications', value: userProfile.skills?.join(', ') || 'Not provided', formField: 'input[name="skills"]', status: userProfile.skills?.length ? 'mapped' : 'optional' },
+    { label: 'Schedule Availability', value: userProfile.preferredDays?.join(', ') || 'Not provided', formField: 'select[name="availability"]', status: userProfile.preferredDays?.length ? 'mapped' : 'missing' },
     { label: 'Motivation Statement', value: userNotes || tailoredMotivation, formField: 'textarea[name="motivation"]', status: 'mapped' }
   ];
 
@@ -324,7 +338,7 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
                 <span>Autonomous Volunteer Agent</span>
               </div>
               <h3 className="font-serif text-lg sm:text-xl font-bold text-white">
-                {finalState ? 'Registration Outcome Verified' : 'Application Review & Autonomous Submission'}
+                {finalState ? 'Registration Outcome Verified' : 'Application Review & Organization Confirmation'}
               </h3>
             </div>
           </div>
@@ -437,7 +451,7 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
                   <div className="flex items-start gap-2.5">
                     <User className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
                     <div>
-                      <span className="font-bold block">Sign In Required to Auto-Apply</span>
+                      <span className="font-bold block">Sign In Required to Record This Application</span>
                       <span>An authenticated volunteer account is required to link and persist your registered event.</span>
                     </div>
                   </div>
@@ -715,14 +729,14 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
                           rel="noopener noreferrer"
                           className="text-[#315D48] hover:text-[#244C3A] inline-flex items-center gap-1 shrink-0 text-[11px] font-medium hover:underline"
                         >
-                          <span>Inspect</span>
+                          <span>Open Registration Page</span>
                           <ExternalLink className="w-3 h-3" />
                         </a>
                       </div>
                     ) : (
                       <div className="p-3 bg-amber-50 rounded-xl border border-amber-200 text-amber-900 space-y-2">
                         <p className="font-medium text-xs">
-                          No direct automated registration form URL is configured for this opportunity. Auto-Apply is disabled to prevent unverified submissions.
+                          No direct registration URL is configured for this opportunity. Continue through the organization’s source page and complete registration there.
                         </p>
                         {opportunity.sourceUrl && opportunity.sourceUrl !== 'public-web' && (
                           <a
@@ -869,7 +883,7 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
                     {isExecuting ? (
                       <>
                         <Loader2 className="w-4 h-4 animate-spin text-[#D6C49A]" />
-                        <span>ApplyPilot Submitting & Verifying...</span>
+                        <span>Checking the destination...</span>
                       </>
                     ) : !isDestinationUsable ? (
                       <>
@@ -879,7 +893,7 @@ export const RegistrationModal: React.FC<RegistrationModalProps> = ({
                     ) : (
                       <>
                         <Bot className="w-4 h-4 text-[#D6C49A]" />
-                        <span>Authorize ApplyPilot Auto-Apply</span>
+                        <span>Continue to Organization</span>
                         <ArrowRight className="w-3.5 h-3.5" />
                       </>
                     )}

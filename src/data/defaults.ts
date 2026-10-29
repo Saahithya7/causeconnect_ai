@@ -3,12 +3,12 @@ import { VolunteerProfile, ImpactMetrics } from '../types';
 export const EMPTY_USER_PROFILE: VolunteerProfile = {
   name: '',
   email: '',
-  age: 21,
+  age: 0,
   city: '',
   hasBackgroundCheck: false,
-  preferredCauses: ['Education', 'Healthcare', 'Community Service'],
-  skills: ['Communication'],
-  preferredDays: ['Saturday', 'Sunday'],
+  preferredCauses: [],
+  skills: [],
+  preferredDays: [],
   preferredFormat: 'all',
   maxDistanceMiles: 25,
   bio: ''

@@ -163,3 +163,34 @@ export async function requireAuth(
     });
   }
 }
+
+export async function requireVerifiedAuth(
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1]?.trim();
+  if (!token) {
+    res.status(401).json({ success: false, error: 'Authentication required.' });
+    return;
+  }
+
+  try {
+    const { data, error } = await getSupabaseServerClient().auth.getUser(token);
+    if (error || !data.user) {
+      res.status(401).json({ success: false, error: 'Invalid or expired session token.' });
+      return;
+    }
+
+    req.user = {
+      id: data.user.id,
+      email: data.user.email,
+      role: data.user.role
+    };
+    next();
+  } catch (error) {
+    console.error('[Verified Auth Middleware Error]:', error instanceof Error ? error.message : 'Unknown error');
+    res.status(500).json({ success: false, error: 'Failed to verify authentication session.' });
+  }
+}

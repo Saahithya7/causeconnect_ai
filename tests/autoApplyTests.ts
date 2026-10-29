@@ -3,7 +3,7 @@
  * Validates:
  * 1. Destination URL rejection of 'public-web' and internal destination classifications
  * 2. CommitMate timing parsing and advisory validation
- * 3. Playwright autonomous form navigation, DOM field filling, submission, and confirmation receipt verification
+ * 3. Explicit test-mode Playwright simulation (no real volunteer-site submissions)
  * 4. Waitlist detection with verified queue proof
  * 5. Error handling without fake AUDIT- codes or false success
  * 6. Supabase database persistence with foreign-key constraints
@@ -13,7 +13,11 @@ if (typeof globalThis !== 'undefined' && typeof (globalThis as any).WebSocket ==
   (globalThis as any).WebSocket = WebSocket;
 }
 
-import { validateTargetUrl } from '../src/server/playwrightService.js';
+import {
+  isValidIdealistListingUrl,
+  standardNGOAdapter,
+  validateTargetUrl
+} from '../src/server/playwrightService.js';
 import { parseEventDateTime, detectScheduleConflicts } from '../src/lib/commitMateSchedule.js';
 import {
   prepareRegistrationProposal,
@@ -23,6 +27,8 @@ import {
 } from '../src/server/registrationAgent.js';
 import { createSupabaseRegistration } from '../src/services/supabaseService.js';
 import { createClient } from '@supabase/supabase-js';
+
+process.env.NODE_ENV = 'test';
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://sgndetrsmhlkelqjsumz.supabase.co';
 const ANON_KEY = 'sb_publishable_tmYz69ggBOYLpW9zTsQvEA_ZRxNrcWD';
@@ -118,6 +124,85 @@ async function runAutoApplyTests() {
   let passed = 0;
   let failed = 0;
 
+  // Test 0: Deterministic eligibility must not invent missing volunteer facts or consent
+  try {
+    console.log('Running Test 0: Missing profile facts, age restrictions, and consent gating...');
+
+    const missing = evaluateEligibility(
+      { age: 0, skills: [], preferredDays: [] },
+      { minAge: 18, requiredSkills: ['First Aid'], schedule: ['Saturday'] }
+    );
+    if (missing.status !== 'Needs more information' || missing.missingInformation.length < 2) {
+      throw new Error('Missing age and availability must block preparation without fabricated defaults.');
+    }
+
+    const underage = evaluateEligibility(
+      { age: 17, preferredDays: ['Saturday'] },
+      { minAge: 18, schedule: ['Saturday'] }
+    );
+    if (underage.status !== 'Ineligible') {
+      throw new Error('A confirmed age below the minimum must be ineligible.');
+    }
+
+    const needsConsent = evaluateEligibility(
+      { age: 24, preferredDays: ['Saturday'], hasBackgroundCheck: true },
+      { minAge: 18, backgroundCheckRequired: true, schedule: ['Saturday'] }
+    );
+    if (needsConsent.status !== 'Awaiting consent' || !needsConsent.requiresBackgroundCheckConsent) {
+      throw new Error('A background check record must not substitute for event-specific consent.');
+    }
+
+    console.log('  ✓ Test 0 Passed: Missing facts remain missing; eligibility and consent are enforced.\n');
+    passed++;
+  } catch (err: any) {
+    console.error('  ✗ Test 0 Failed:', err?.message || err);
+    failed++;
+  }
+
+  // Test 0b: Supported-platform adapter must not claim or simulate a submission
+  try {
+    console.log('Running Test 0b: Adapter reports manual handoff without submitting...');
+
+    let openedUrl = '';
+    const mockPage = {
+      goto: async (url: string) => { openedUrl = url; },
+      locator: () => ({ innerText: async () => '' }),
+      url: () => openedUrl
+    };
+    const adapterResult = await standardNGOAdapter.submit(mockPage as any, {
+      profile: {
+        name: 'Test Volunteer',
+        email: 'test@example.com',
+        age: 25,
+        city: '',
+        hasBackgroundCheck: false,
+        preferredCauses: [],
+        skills: [],
+        preferredDays: [],
+        preferredFormat: 'all',
+        maxDistanceMiles: 0,
+        bio: ''
+      },
+      event: {
+        id: 'test-event',
+        title: 'Test opportunity',
+        organization: 'Test organization',
+        destinationUrl: 'https://www.volunteermatch.org/'
+      },
+      consents: { backgroundCheck: false, terms: false }
+    });
+
+    if (adapterResult.status !== 'verification_inconclusive' || /submitted successfully|confirmed/i.test(adapterResult.evidenceText)) {
+      throw new Error('The generic source adapter must not report success without a site-specific verified submission.');
+    }
+
+    console.log('  ✓ Test 0b Passed: The adapter stopped for manual completion and made no submission.\n');
+    passed++;
+  } catch (err: any) {
+    console.error('  ✗ Test 0b Failed:', err?.message || err);
+    failed++;
+  }
+
   // Test 1: Destination URL validation rejects public-web & domain labels
   try {
     console.log('Running Test 1: Destination URL rejection of "public-web"...');
@@ -128,8 +213,16 @@ async function runAutoApplyTests() {
     const check2 = await validateTargetUrl('https://public-web/register');
     if (check2.valid) throw new Error('Expected "https://public-web/register" to be rejected.');
 
-    const check3 = await validateTargetUrl('https://greenhyd-test.org/lake-cleanup/register');
-    if (!check3.valid) throw new Error(`Expected valid approved partner URL to pass: ${check3.reason}`);
+    const check3 = await validateTargetUrl('https://www.volunteermatch.org/');
+    if (!check3.valid) throw new Error(`Expected verified volunteer platform URL to pass: ${check3.reason}`);
+    const testDomain = await validateTargetUrl('https://greenhyd-test.org/lake-cleanup/register');
+    if (testDomain.valid) throw new Error('Expected -test.org destination to remain blocked.');
+    if (!isValidIdealistListingUrl('https://www.idealist.org/en/volunteer-opportunity/123-example')) {
+      throw new Error('Expected an Idealist volunteer listing path to be supported.');
+    }
+    if (isValidIdealistListingUrl('https://www.idealist.org/en/search/volunteer-opportunities')) {
+      throw new Error('Search and account pages must not be accepted as application listing URLs.');
+    }
 
     console.log('  ✓ Test 1 Passed: "public-web" and invalid classifications strictly rejected.\n');
     passed++;
@@ -170,7 +263,7 @@ async function runAutoApplyTests() {
 
   // Test 3: Playwright autonomous form navigation, DOM field filling & verification
   try {
-    console.log('Running Test 3: Playwright autonomous form filling & confirmation verification...');
+    console.log('Running Test 3: Explicit test-only registration simulation...');
 
     const testOpp = {
       id: 'opp-tree-canopy-1',
@@ -234,7 +327,7 @@ async function runAutoApplyTests() {
     if (!approval.success) throw new Error('Proposal approval failed.');
 
     // 3. Playwright Execution
-    const execRes = await executeRegistrationWorkflow(proposal.proposalId);
+    const execRes = await executeRegistrationWorkflow(proposal.proposalId, { testMode: true });
 
     if (!execRes.success || execRes.state !== 'confirmed') {
       throw new Error(`Execution failed: ${execRes.error || execRes.state}`);
@@ -245,7 +338,7 @@ async function runAutoApplyTests() {
       throw new Error(`Invalid confirmation reference: ${execRes.verificationResult.confirmationReference}`);
     }
 
-    console.log(`  ✓ Test 3 Passed: Playwright filled DOM form, submitted, and verified code #${execRes.verificationResult.confirmationReference}.\n`);
+    console.log(`  ✓ Test 3 Passed: Explicit test fixture produced a simulated confirmation #${execRes.verificationResult.confirmationReference}.\n`);
     passed++;
   } catch (err: any) {
     console.error('  ✗ Test 3 Failed:', err?.message || err);
@@ -254,7 +347,7 @@ async function runAutoApplyTests() {
 
   // Test 4: Waitlist verification for capacity-reached events
   try {
-    console.log('Running Test 4: Playwright autonomous waitlist detection...');
+    console.log('Running Test 4: Explicit test-only simulated waitlist response...');
 
     const waitlistOpp = {
       id: 'opp-lake-cleanup-wl',
@@ -305,7 +398,10 @@ async function runAutoApplyTests() {
       backgroundCheckConsented: false
     });
 
-    const execRes = await executeRegistrationWorkflow(proposal.proposalId);
+    const execRes = await executeRegistrationWorkflow(proposal.proposalId, {
+      testMode: true,
+      simulatedWaitlist: true
+    });
 
     if (execRes.state !== 'waitlisted' || execRes.verificationResult.status !== 'waitlisted') {
       throw new Error(`Expected waitlisted state, got: ${execRes.state}`);
@@ -315,7 +411,7 @@ async function runAutoApplyTests() {
       throw new Error(`Expected waitlist reference code starting with WL-, got: ${execRes.verificationResult.confirmationReference}`);
     }
 
-    console.log(`  ✓ Test 4 Passed: Autonomous waitlist outcome verified with queue reference #${execRes.verificationResult.confirmationReference}.\n`);
+    console.log(`  ✓ Test 4 Passed: Test-only simulated waitlist outcome recorded with reference #${execRes.verificationResult.confirmationReference}.\n`);
     passed++;
   } catch (err: any) {
     console.error('  ✗ Test 4 Failed:', err?.message || err);
@@ -434,7 +530,7 @@ async function runAutoApplyTests() {
   }
 
   console.log('======================================================================');
-  console.log(`Auto-Apply Test Results: Passed: ${passed} / 6 | Failed: ${failed} / 6`);
+  console.log(`Auto-Apply Test Results: Passed: ${passed} / 8 | Failed: ${failed} / 8`);
   console.log('======================================================================');
 
   if (failed > 0) {

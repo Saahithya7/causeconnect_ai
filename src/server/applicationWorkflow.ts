@@ -1,7 +1,6 @@
 import crypto from 'crypto';
 import type {
   VolunteerProfile,
-  Opportunity,
   ApplicationStatus,
   ApplicationRecord,
   ApplyPilotFieldMapping
@@ -14,17 +13,142 @@ import {
 } from './registrationAgent.js';
 import {
   withPlaywrightPage,
-  standardNGOAdapter,
-  searchPublicOpportunities
+  standardNGOAdapter
 } from './playwrightService.js';
-import { isBrowserbaseConfigured } from './browserbaseAgent.js';
 import { ensureValidUuid } from '../lib/uuidHelper.js';
 
-// In-memory application storage with Supabase database synchronization
-const applicationsStore = new Map<string, ApplicationRecord>();
+function applicationFromRow(row: Record<string, any>): ApplicationRecord {
+  const dataToSubmit = row.data_to_submit && typeof row.data_to_submit === 'object'
+    ? { ...row.data_to_submit }
+    : {};
+  const workflow = dataToSubmit.__causeconnect_workflow || {};
+  delete dataToSubmit.__causeconnect_workflow;
 
-export function getApplicationById(id: string): ApplicationRecord | null {
-  return applicationsStore.get(id) || null;
+  return {
+    id: row.id,
+    userId: row.user_id,
+    eventId: row.opportunity_id,
+    eventTitle: workflow.eventTitle || '',
+    organization: workflow.organization || '',
+    destinationUrl: workflow.destinationUrl || '',
+    status: row.status as ApplicationStatus,
+    draftVersion: row.draft_version,
+    actionHash: row.action_hash,
+    idempotencyKey: row.idempotency_key,
+    dataToSubmit,
+    fieldMapping: workflow.fieldMapping,
+    generatedMotivation: workflow.generatedMotivation,
+    approvalTimestamp: row.approval_timestamp || undefined,
+    approvedByUserId: row.approved_by_user_id || undefined,
+    verificationEvidence: row.verification_evidence || undefined,
+    confirmationReference: row.confirmation_reference || undefined,
+    observedStatus: row.observed_status || undefined,
+    lastCheckedAt: workflow.lastCheckedAt || undefined,
+    error: row.error_details || undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+async function persistApplication(application: ApplicationRecord): Promise<void> {
+  const supabase = getSupabaseServerClient();
+  const { error } = await supabase.from('applications').upsert({
+    id: application.id,
+    user_id: application.userId,
+    opportunity_id: application.eventId,
+    status: application.status,
+    draft_version: application.draftVersion,
+    action_hash: application.actionHash,
+    idempotency_key: application.idempotencyKey,
+    data_to_submit: {
+      ...application.dataToSubmit,
+      __causeconnect_workflow: {
+        eventTitle: application.eventTitle,
+        organization: application.organization,
+        destinationUrl: application.destinationUrl,
+        fieldMapping: application.fieldMapping,
+        generatedMotivation: application.generatedMotivation,
+        lastCheckedAt: application.lastCheckedAt
+      }
+    },
+    approval_timestamp: application.approvalTimestamp || null,
+    approved_by_user_id: application.approvedByUserId || null,
+    verification_evidence: application.verificationEvidence || null,
+    confirmation_reference: application.confirmationReference || null,
+    observed_status: application.observedStatus || null,
+    error_details: application.error || null,
+    created_at: application.createdAt,
+    updated_at: application.updatedAt
+  }, { onConflict: 'id' });
+
+  if (error) {
+    throw new Error(`Failed to persist application ${application.id}: ${error.message}`);
+  }
+}
+
+async function claimApprovedApplication(applicationId: string, userId: string): Promise<ApplicationRecord | null> {
+  const { data, error } = await getSupabaseServerClient()
+    .from('applications')
+    .update({
+      status: 'submitting',
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', applicationId)
+    .eq('user_id', userId)
+    .eq('status', 'approved')
+    .select('*')
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to claim the approved application: ${error.message}`);
+  }
+  if (!data) return null;
+
+  const application = applicationFromRow(data);
+  return application;
+}
+
+async function persistVerifiedRegistration(application: ApplicationRecord): Promise<void> {
+  const supabase = getSupabaseServerClient();
+  const opportunityId = ensureValidUuid(application.eventId);
+  const { error: opportunityError } = await supabase.from('opportunities').upsert({
+    id: opportunityId,
+    title: application.eventTitle,
+    organization_name: application.organization,
+    source_url: application.destinationUrl
+  }, { onConflict: 'id' });
+
+  if (opportunityError) {
+    throw new Error(`Failed to persist the verified opportunity: ${opportunityError.message}`);
+  }
+
+  const { error: registrationError } = await supabase.from('registrations').upsert({
+    user_id: application.userId,
+    opportunity_id: opportunityId,
+    status: application.status === 'verified' ? 'confirmed' : 'waitlisted',
+    confirmation_reference: application.confirmationReference || null,
+    submitted_at: application.updatedAt,
+    updated_at: application.updatedAt
+  }, { onConflict: 'user_id,opportunity_id' });
+
+  if (registrationError) {
+    throw new Error(`Failed to persist the verified registration: ${registrationError.message}`);
+  }
+}
+
+export async function getApplicationById(id: string): Promise<ApplicationRecord | null> {
+  const { data, error } = await getSupabaseServerClient()
+    .from('applications')
+    .select('*')
+    .eq('id', id)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to load application ${id}: ${error.message}`);
+  }
+  if (!data) return null;
+  const application = applicationFromRow(data);
+  return application;
 }
 
 /**
@@ -34,14 +158,16 @@ export function generateTailoredMotivation(
   profile: VolunteerProfile,
   event: { title: string; organization: string }
 ): string {
-  const topSkills = profile.skills && profile.skills.length > 0
-    ? profile.skills.slice(0, 3).join(', ')
-    : 'community teamwork and problem-solving';
-  const cause = profile.preferredCauses && profile.preferredCauses.length > 0
-    ? profile.preferredCauses[0]
-    : 'community empowerment';
+  const details = [
+    profile.skills?.length ? `My profile lists these skills: ${profile.skills.slice(0, 3).join(', ')}.` : '',
+    profile.preferredCauses?.length ? `I am interested in ${profile.preferredCauses[0]}.` : '',
+    profile.city ? `I am based in ${profile.city}.` : ''
+  ].filter(Boolean);
 
-  return `I am eager to contribute as a volunteer for "${event.title}" hosted by ${event.organization}. With practical experience in ${topSkills} and a strong commitment to ${cause}, I look forward to supporting your mission and collaborating effectively with the event team in ${profile.city || 'the local area'}.`;
+  return [
+    `I am interested in volunteering for "${event.title}" with ${event.organization}.`,
+    ...details
+  ].join(' ');
 }
 
 /**
@@ -76,7 +202,7 @@ export function buildApplyPilotFieldMapping(
     age: {
       field: 'Age Verification / DOB',
       value: profile.age,
-      status: profile.age !== undefined && profile.age !== null ? 'mapped' : 'missing'
+      status: profile.age > 0 ? 'mapped' : 'missing'
     },
     city: {
       field: 'Residential Location / City',
@@ -116,53 +242,50 @@ export function buildApplyPilotFieldMapping(
  * Fetch profile from Supabase profiles table
  */
 export async function getProfileByUserId(userId: string): Promise<VolunteerProfile | null> {
-  try {
-    const supabase = getSupabaseServerClient();
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('*')
-      .eq('user_id', userId)
-      .maybeSingle();
+  const { data, error } = await getSupabaseServerClient()
+    .from('profiles')
+    .select('*')
+    .eq('user_id', userId)
+    .maybeSingle();
 
-    if (error || !data) {
-      return null;
-    }
-
-    let calculatedAge = data.age || 21;
-    if (data.date_of_birth) {
-      const birthDate = new Date(data.date_of_birth);
-      if (!isNaN(birthDate.getTime())) {
-        const today = new Date();
-        let age = today.getFullYear() - birthDate.getFullYear();
-        const m = today.getMonth() - birthDate.getMonth();
-        if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) {
-          age--;
-        }
-        calculatedAge = age;
-      }
-    }
-
-    return {
-      name: data.full_name || 'Volunteer',
-      email: data.email || '',
-      age: calculatedAge,
-      dateOfBirth: data.date_of_birth || undefined,
-      phone: data.phone || undefined,
-      educationExperience: data.bio || undefined,
-      city: data.location || 'Local Area',
-      hasBackgroundCheck: Boolean(data.has_background_check),
-      backgroundCheckConsent: Boolean(data.background_check_consent),
-      preferredCauses: Array.isArray(data.interests) ? data.interests : ['Community Service'],
-      skills: Array.isArray(data.skills) ? data.skills : ['Volunteer Assistance'],
-      preferredDays: Array.isArray(data.availability) ? data.availability : ['Saturday', 'Sunday'],
-      preferredFormat: 'all',
-      maxDistanceMiles: 25,
-      bio: data.bio || ''
-    };
-  } catch (err) {
-    console.warn('[ApplicationWorkflow] Supabase profile fetch fallback:', err);
-    return null;
+  if (error) {
+    throw new Error(`Failed to load volunteer profile: ${error.message}`);
   }
+  if (!data) return null;
+
+  let calculatedAge = 0;
+  if (data.date_of_birth) {
+    const birthDate = new Date(`${data.date_of_birth}T00:00:00`);
+    if (!Number.isNaN(birthDate.getTime())) {
+      const today = new Date();
+      calculatedAge = today.getFullYear() - birthDate.getFullYear();
+      if (
+        today.getMonth() < birthDate.getMonth() ||
+        (today.getMonth() === birthDate.getMonth() && today.getDate() < birthDate.getDate())
+      ) {
+        calculatedAge--;
+      }
+      if (calculatedAge < 0) calculatedAge = 0;
+    }
+  }
+
+  return {
+    name: data.full_name || '',
+    email: data.email || '',
+    age: calculatedAge,
+    dateOfBirth: data.date_of_birth || undefined,
+    phone: data.phone || undefined,
+    educationExperience: data.education_experience || data.bio || undefined,
+    city: data.location || '',
+    hasBackgroundCheck: Boolean(data.has_background_check),
+    backgroundCheckConsent: Boolean(data.background_check_consent),
+    preferredCauses: Array.isArray(data.interests) ? data.interests : [],
+    skills: Array.isArray(data.skills) ? data.skills : [],
+    preferredDays: Array.isArray(data.availability) ? data.availability : [],
+    preferredFormat: 'all',
+    maxDistanceMiles: 25,
+    bio: data.bio || ''
+  };
 }
 
 /**
@@ -188,6 +311,9 @@ export async function updateProfileByUserId(
     if (updates.preferredDays !== undefined) payload.availability = updates.preferredDays;
     if (updates.phone !== undefined) payload.phone = updates.phone;
     if (updates.dateOfBirth !== undefined) payload.date_of_birth = updates.dateOfBirth;
+    if (updates.educationExperience !== undefined) payload.education_experience = updates.educationExperience;
+    if (updates.hasBackgroundCheck !== undefined) payload.has_background_check = updates.hasBackgroundCheck;
+    if (updates.backgroundCheckConsent !== undefined) payload.background_check_consent = updates.backgroundCheckConsent;
 
     const { error } = await supabase
       .from('profiles')
@@ -225,11 +351,11 @@ export async function prepareApplicationWorkflow(
   },
   options: {
     userNotes?: string;
-    overrideProfile?: Partial<VolunteerProfile>;
   } = {}
 ): Promise<{
   success: boolean;
   application?: ApplicationRecord;
+  alreadyApplied?: boolean;
   fieldMapping?: ApplyPilotFieldMapping;
   generatedMotivation?: string;
   eligibility: any;
@@ -239,41 +365,7 @@ export async function prepareApplicationWorkflow(
   error?: string;
 }> {
   // 1. Fetch user's saved profile from database
-  let profile = await getProfileByUserId(userId);
-
-  if (!profile && options.overrideProfile) {
-    let overrideAge = options.overrideProfile.age || 21;
-    if (options.overrideProfile.dateOfBirth) {
-      const bDate = new Date(options.overrideProfile.dateOfBirth);
-      if (!isNaN(bDate.getTime())) {
-        const today = new Date();
-        let calculated = today.getFullYear() - bDate.getFullYear();
-        const m = today.getMonth() - bDate.getMonth();
-        if (m < 0 || (m === 0 && today.getDate() < bDate.getDate())) {
-          calculated--;
-        }
-        overrideAge = calculated;
-      }
-    }
-
-    profile = {
-      name: options.overrideProfile.name || 'Volunteer',
-      email: options.overrideProfile.email || '',
-      age: overrideAge,
-      dateOfBirth: options.overrideProfile.dateOfBirth,
-      phone: options.overrideProfile.phone,
-      educationExperience: options.overrideProfile.educationExperience,
-      city: options.overrideProfile.city || 'City',
-      hasBackgroundCheck: Boolean(options.overrideProfile.hasBackgroundCheck),
-      backgroundCheckConsent: Boolean(options.overrideProfile.backgroundCheckConsent),
-      preferredCauses: options.overrideProfile.preferredCauses || ['Community Service'],
-      skills: options.overrideProfile.skills || ['Communication'],
-      preferredDays: options.overrideProfile.preferredDays || ['Saturday', 'Sunday'],
-      preferredFormat: 'all',
-      maxDistanceMiles: 25,
-      bio: options.overrideProfile.bio || ''
-    };
-  }
+  const profile = await getProfileByUserId(userId);
 
   if (!profile) {
     return {
@@ -282,6 +374,51 @@ export async function prepareApplicationWorkflow(
       missingInformation: ['Saved Volunteer Profile'],
       isIneligible: false,
       error: 'Authenticated volunteer profile could not be loaded from Supabase.'
+    };
+  }
+
+  const { data: existingApplicationRow, error: existingApplicationError } = await getSupabaseServerClient()
+    .from('applications')
+    .select('*')
+    .eq('user_id', userId)
+    .eq('opportunity_id', event.id)
+    .maybeSingle();
+
+  if (existingApplicationError) {
+    throw new Error(`Failed to check for an existing application: ${existingApplicationError.message}`);
+  }
+  const existingApp = existingApplicationRow ? applicationFromRow(existingApplicationRow) : null;
+
+  const { data: registration, error: registrationError } = await getSupabaseServerClient()
+    .from('registrations')
+    .select('id, status')
+    .eq('user_id', userId)
+    .eq('opportunity_id', event.id)
+    .maybeSingle();
+
+  if (registrationError) {
+    throw new Error(`Failed to check existing registrations: ${registrationError.message}`);
+  }
+  if (registration) {
+    return {
+      success: false,
+      alreadyApplied: true,
+      eligibility: null,
+      missingInformation: [],
+      isIneligible: false,
+      error: `A registration already exists for this event (Status: ${registration.status || 'recorded'}). Duplicate attempts are prevented.`
+    };
+  }
+
+  if (existingApp && existingApp.status !== 'draft' && existingApp.status !== 'awaiting_approval') {
+    return {
+      success: false,
+      application: existingApp,
+      alreadyApplied: true,
+      eligibility: null,
+      missingInformation: [],
+      isIneligible: false,
+      error: `An application record already exists for this event (Status: ${existingApp.status}). Duplicate attempts are prevented.`
     };
   }
 
@@ -341,34 +478,21 @@ export async function prepareApplicationWorkflow(
     };
   }
 
-  // 4. Duplicate Check: Search existing applications for this user and event
-  const existingApp = Array.from(applicationsStore.values()).find(
-    (app) => app.userId === userId && app.eventId === event.id
-  );
-
-  if (existingApp && (existingApp.status === 'verified' || existingApp.status === 'waitlisted')) {
-    return {
-      success: false,
-      eligibility,
-      missingInformation: [],
-      isIneligible: false,
-      error: `You have already submitted an application for this event (Status: ${existingApp.status}). Duplicate submissions are prevented.`
-    };
-  }
-
   // 5. Check Missing Information
-  const missingFields: string[] = [];
+  const missingFields: string[] = [...eligibility.missingInformation];
   if (!profile.name || profile.name.trim().length === 0) missingFields.push('Full Name');
   if (!profile.email || !profile.email.includes('@')) missingFields.push('Valid Email Address');
-  if (profile.age === undefined || profile.age === null) missingFields.push('Verified Age or Date of Birth');
+  if (!profile.age || profile.age <= 0) missingFields.push('Verified Age or Date of Birth');
 
-  if (missingFields.length > 0) {
+  const uniqueMissingFields = [...new Set(missingFields)];
+
+  if (uniqueMissingFields.length > 0) {
     return {
       success: false,
       eligibility,
-      missingInformation: missingFields,
+      missingInformation: uniqueMissingFields,
       isIneligible: false,
-      error: `Please update your profile with missing required information: ${missingFields.join(', ')}`
+      error: `Please update your profile with missing required information: ${uniqueMissingFields.join(', ')}`
     };
   }
 
@@ -413,7 +537,17 @@ export async function prepareApplicationWorkflow(
     updatedAt: new Date().toISOString()
   };
 
-  applicationsStore.set(applicationId, application);
+  try {
+    await persistApplication(application);
+  } catch (err: any) {
+    return {
+      success: false,
+      eligibility,
+      missingInformation: [],
+      isIneligible: false,
+      error: err?.message || 'Failed to save the application draft.'
+    };
+  }
 
   return {
     success: true,
@@ -429,7 +563,7 @@ export async function prepareApplicationWorkflow(
 /**
  * Step 13-14: Explicit User Approval
  */
-export function approveApplicationWorkflow(
+export async function approveApplicationWorkflow(
   applicationId: string,
   userId: string,
   approvalInput: {
@@ -437,12 +571,12 @@ export function approveApplicationWorkflow(
     expectedActionHash: string;
     backgroundCheckConsented?: boolean;
   }
-): {
+): Promise<{
   success: boolean;
   application?: ApplicationRecord;
   error?: string;
-} {
-  const application = applicationsStore.get(applicationId);
+}> {
+  const application = await getApplicationById(applicationId);
 
   if (!application) {
     return { success: false, error: 'Application record not found.' };
@@ -451,6 +585,13 @@ export function approveApplicationWorkflow(
   // Ownership verification
   if (application.userId !== userId) {
     return { success: false, error: 'Unauthorized: Cannot approve an application belonging to another user.' };
+  }
+
+  if (application.status !== 'draft' && application.status !== 'awaiting_approval') {
+    return {
+      success: false,
+      error: `Application cannot be approved from state "${application.status}".`
+    };
   }
 
   // Verify unchanged draft version and payload action hash
@@ -468,16 +609,30 @@ export function approveApplicationWorkflow(
     };
   }
 
-  application.status = 'approved';
-  application.approvedByUserId = userId;
-  application.approvalTimestamp = new Date().toISOString();
-  application.updatedAt = new Date().toISOString();
+  const approvedApplication: ApplicationRecord = {
+    ...application,
+    status: 'approved',
+    approvedByUserId: userId,
+    approvalTimestamp: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    dataToSubmit: { ...application.dataToSubmit }
+  };
 
   if (approvalInput.backgroundCheckConsented !== undefined) {
-    application.dataToSubmit.backgroundCheckConsented = approvalInput.backgroundCheckConsented;
+    approvedApplication.dataToSubmit.backgroundCheckConsented = approvalInput.backgroundCheckConsented;
+    approvedApplication.actionHash = computeActionHash(approvedApplication.dataToSubmit);
   }
 
-  return { success: true, application };
+  try {
+    await persistApplication(approvedApplication);
+  } catch (err: any) {
+    return {
+      success: false,
+      error: err?.message || 'Failed to persist application approval.'
+    };
+  }
+
+  return { success: true, application: approvedApplication };
 }
 
 /**
@@ -486,23 +641,17 @@ export function approveApplicationWorkflow(
 export async function executeApplicationWorkflow(
   applicationId: string,
   userId: string,
-  options: {
-    testMode?: boolean;
-  } = {}
+  _options: { testMode?: boolean } = {}
 ): Promise<{
   success: boolean;
-  application: ApplicationRecord;
+  application?: ApplicationRecord;
   verificationEvidence?: string;
   error?: string;
 }> {
-  const application = applicationsStore.get(applicationId);
+  const application = await getApplicationById(applicationId);
 
   if (!application) {
-    return {
-      success: false,
-      application: {} as any,
-      error: 'Application record not found.'
-    };
+    return { success: false, error: 'Application record not found.' };
   }
 
   // Ownership verification
@@ -523,8 +672,45 @@ export async function executeApplicationWorkflow(
     };
   }
 
-  application.status = 'submitting';
-  application.updatedAt = new Date().toISOString();
+  const { data: existingRegistration, error: registrationLookupError } = await getSupabaseServerClient()
+    .from('registrations')
+    .select('id, status')
+    .eq('user_id', userId)
+    .eq('opportunity_id', application.eventId)
+    .maybeSingle();
+  if (registrationLookupError) {
+    return {
+      success: false,
+      application,
+      error: `Could not confirm duplicate-registration status: ${registrationLookupError.message}`
+    };
+  }
+  if (existingRegistration) {
+    return {
+      success: false,
+      application,
+      error: `A registration already exists for this event (Status: ${existingRegistration.status || 'recorded'}). No application was opened.`
+    };
+  }
+
+  let submittingApplication: ApplicationRecord;
+  try {
+    const claimedApplication = await claimApprovedApplication(applicationId, userId);
+    if (!claimedApplication) {
+      return {
+        success: false,
+        application,
+        error: 'This application has already been claimed or is no longer approved. It will not be submitted twice.'
+      };
+    }
+    submittingApplication = claimedApplication;
+  } catch (err: any) {
+    return {
+      success: false,
+      application,
+      error: err?.message || 'Failed to persist the application execution state.'
+    };
+  }
 
   try {
     const profile: VolunteerProfile = {
@@ -557,61 +743,49 @@ export async function executeApplicationWorkflow(
         },
         consents: {
           backgroundCheck: Boolean(application.dataToSubmit.backgroundCheckConsented),
-          terms: true
+          terms: false
         }
       });
     }, { timeoutMs: 18000 });
 
-    application.status = result.status;
-    application.confirmationReference = result.confirmationReference;
-    application.verificationEvidence = result.evidenceText;
-    application.observedStatus = result.status;
-    application.updatedAt = new Date().toISOString();
+    const updatedApplication: ApplicationRecord = {
+      ...submittingApplication,
+      status: result.status,
+      confirmationReference: result.confirmationReference,
+      verificationEvidence: result.evidenceText,
+      observedStatus: result.status,
+      updatedAt: new Date().toISOString()
+    };
+    await persistApplication(updatedApplication);
+    const awaitingManualConfirmation = result.status === 'verification_inconclusive';
+    return {
+      success: !awaitingManualConfirmation,
+      application: updatedApplication,
+      verificationEvidence: result.evidenceText,
+      ...(awaitingManualConfirmation && { error: result.evidenceText })
+    };
+  } catch (err: any) {
+    const failedApplication: ApplicationRecord = {
+      ...submittingApplication,
+      status: 'failed',
+      error: err?.message || 'Playwright could not open the destination.',
+      updatedAt: new Date().toISOString()
+    };
 
-    // Persist to Supabase registrations table
     try {
-      const supabase = getSupabaseServerClient();
-      const oppUuid = ensureValidUuid(application.eventId);
-
-      // Ensure opportunity row exists for foreign key constraint
-      await supabase.from('opportunities').upsert({
-        id: oppUuid,
-        title: application.eventTitle,
-        organization_name: application.organization,
-        source_url: application.destinationUrl
-      }, { onConflict: 'id' });
-
-      const regStatus = result.status === 'verified' ? 'confirmed' : result.status;
-      const { error: dbErr } = await supabase.from('registrations').upsert({
-        user_id: userId,
-        opportunity_id: oppUuid,
-        status: regStatus,
-        confirmation_reference: result.confirmationReference || null,
-        submitted_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      }, { onConflict: 'user_id,opportunity_id' });
-
-      if (dbErr) {
-        console.error('[ApplicationWorkflow] Database registration insertion error:', dbErr.message);
-      }
-    } catch (dbErr: any) {
-      console.error('[ApplicationWorkflow] Database registration insertion exception:', dbErr?.message);
+      await persistApplication(failedApplication);
+    } catch (dbError: any) {
+      return {
+        success: false,
+        application: submittingApplication,
+        error: `${err?.message || 'Playwright could not open the destination.'} Application status could not be saved: ${dbError?.message || dbError}`
+      };
     }
 
     return {
-      success: true,
-      application,
-      verificationEvidence: result.evidenceText
-    };
-  } catch (err: any) {
-    application.status = 'failed';
-    application.error = err?.message || 'Automation submission failed';
-    application.updatedAt = new Date().toISOString();
-
-    return {
       success: false,
-      application,
-      error: err?.message || 'Failed to submit application'
+      application: failedApplication,
+      error: failedApplication.error
     };
   }
 }
@@ -624,17 +798,16 @@ export async function verifyApplicationWorkflow(
   userId: string
 ): Promise<{
   success: boolean;
-  application: ApplicationRecord;
+  application?: ApplicationRecord;
   verified: boolean;
   evidence: string;
   error?: string;
 }> {
-  const application = applicationsStore.get(applicationId);
+  const application = await getApplicationById(applicationId);
 
   if (!application) {
     return {
       success: false,
-      application: {} as any,
       verified: false,
       evidence: '',
       error: 'Application not found'
@@ -651,29 +824,98 @@ export async function verifyApplicationWorkflow(
     };
   }
 
+  if (application.status !== 'submitted_unverified') {
+    return {
+      success: false,
+      application,
+      verified: false,
+      evidence: '',
+      error: `Verification is unavailable for application state "${application.status}". A verified submission attempt is required.`
+    };
+  }
+
   try {
     const verification = await withPlaywrightPage(async (page) => {
       return await standardNGOAdapter.verify(page, application);
     }, { timeoutMs: 15000 });
 
-    application.status = verification.status;
-    application.verificationEvidence = verification.evidence;
-    application.observedStatus = verification.status;
-    application.lastCheckedAt = new Date().toISOString();
-    application.updatedAt = new Date().toISOString();
+    const updatedApplication: ApplicationRecord = {
+      ...application,
+      status: verification.status,
+      verificationEvidence: verification.evidence,
+      observedStatus: verification.status,
+      confirmationReference: verification.verified ? verification.referenceNumber : undefined,
+      lastCheckedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+
+    try {
+      await persistApplication(updatedApplication);
+      if (verification.verified) {
+        await persistVerifiedRegistration(updatedApplication);
+      }
+    } catch (err: any) {
+      const inconclusiveApplication: ApplicationRecord = {
+        ...updatedApplication,
+        status: 'verification_inconclusive',
+        confirmationReference: undefined,
+        verificationEvidence: `Confirmation was observed, but the result could not be saved: ${err?.message || err}`,
+        observedStatus: 'verification_inconclusive',
+        updatedAt: new Date().toISOString()
+      };
+
+      try {
+        await persistApplication(inconclusiveApplication);
+      } catch (persistError: any) {
+        return {
+          success: false,
+          application: inconclusiveApplication,
+          verified: false,
+          evidence: inconclusiveApplication.verificationEvidence || '',
+          error: `Failed to persist verification: ${persistError?.message || persistError}`
+        };
+      }
+      return {
+        success: false,
+        application: inconclusiveApplication,
+        verified: false,
+        evidence: inconclusiveApplication.verificationEvidence || '',
+        error: inconclusiveApplication.verificationEvidence
+      };
+    }
 
     return {
       success: true,
-      application,
+      application: updatedApplication,
       verified: verification.verified,
       evidence: verification.evidence
     };
   } catch (err: any) {
+    const inconclusiveApplication: ApplicationRecord = {
+      ...application,
+      status: 'verification_inconclusive',
+      confirmationReference: undefined,
+      verificationEvidence: `Verification could not be completed: ${err?.message || err}`,
+      observedStatus: 'verification_inconclusive',
+      lastCheckedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    try {
+      await persistApplication(inconclusiveApplication);
+    } catch (persistError: any) {
+      return {
+        success: false,
+        application: inconclusiveApplication,
+        verified: false,
+        evidence: inconclusiveApplication.verificationEvidence || '',
+        error: `Verification failed and its status could not be saved: ${persistError?.message || persistError}`
+      };
+    }
     return {
-      success: false,
-      application,
+      success: true,
+      application: inconclusiveApplication,
       verified: false,
-      evidence: 'Verification inconclusive due to destination connectivity notice.',
+      evidence: inconclusiveApplication.verificationEvidence || '',
       error: err?.message
     };
   }

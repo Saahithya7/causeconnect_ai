@@ -121,7 +121,7 @@ export const AgentActivityView: React.FC<AgentActivityViewProps> = ({
         </div>
       </div>
 
-      {/* Browserbase Discovery Agent Status Card */}
+      {/* Playwright Discovery Agent Status Card */}
       <div className="bg-[#244C3A] text-white rounded-2xl p-5 border border-[#315D48] shadow-xs flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
         <div className="space-y-1">
           <div className="inline-flex items-center gap-2 text-xs font-semibold text-[#D6C49A]">
@@ -129,7 +129,7 @@ export const AgentActivityView: React.FC<AgentActivityViewProps> = ({
             <span>Autonomous Web Agent: CauseConnect Volunteer Event Finder</span>
           </div>
           <p className="text-xs text-[#DFEAE1] max-w-2xl leading-relaxed">
-            Uses server-isolated Browserbase cloud browser automation to navigate live NGO portals, environmental alliances, and municipal volunteer boards without user credential exposure or automatic form submissions.
+            Uses server-isolated Playwright with Chromium for read-only live event discovery. Listings are not independently verified, and no registration forms are submitted.
           </p>
         </div>
         <div className="flex-shrink-0">

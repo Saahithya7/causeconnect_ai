@@ -18,7 +18,6 @@ import {
   getSupabaseConfig,
   supabase
 } from '../lib/supabase';
-import { invokeBackendBrowserbase } from '../services/supabaseService';
 
 interface SettingsViewProps {
   onExportData: () => void;
@@ -40,10 +39,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     message: string;
     tablesFound?: string[];
   } | null>(null);
-
-  // Browserbase Backend Readiness Test State
-  const [isTestingBrowserbase, setIsTestingBrowserbase] = useState(false);
-  const [browserbaseStatus, setBrowserbaseStatus] = useState<string | null>(null);
 
   const showToast = (msg: string) => {
     setToast(msg);
@@ -102,14 +97,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         message: `Connection check failed: ${err?.message || 'Check network connection'}`
       });
     }
-  };
-
-  const handleTestBrowserbase = async () => {
-    setIsTestingBrowserbase(true);
-    setBrowserbaseStatus(null);
-    const res = await invokeBackendBrowserbase('verify', { test: true });
-    setIsTestingBrowserbase(false);
-    setBrowserbaseStatus(res.message);
   };
 
   return (
@@ -243,7 +230,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         </div>
       </div>
 
-      {/* 2. Browserbase Automation Backend Readiness */}
+      {/* 2. Playwright Browser Automation */}
       <div className="bg-white border border-[#D5E0D7] rounded-3xl p-6 sm:p-7 shadow-xs space-y-4">
         <div className="flex items-center gap-3">
           <div className="w-10 h-10 rounded-2xl bg-[#DFEAE1] flex items-center justify-center text-[#244C3A]">
@@ -251,35 +238,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
           <div>
             <h3 className="font-serif text-xl font-bold text-[#244C3A]">
-              Browserbase Autonomous Agent Integration
+              Playwright Chromium Event Discovery
             </h3>
             <p className="text-xs text-[#59665C]">
-              Server-side crawler and evidence verification architecture
+              Server-side, read-only discovery
             </p>
           </div>
         </div>
 
         <p className="text-xs text-[#59665C] leading-relaxed">
-          In compliance with security standards, Browserbase API keys are never exposed in frontend bundles. The client application dispatches requests to the backend endpoint <code>/api/browserbase/execute</code>, which authorizes volunteer verification jobs only after explicit user approval.
+          Live event searches use Playwright with Chromium on the server. Registration forms are not automatically filled or submitted; complete applications directly with the organization and verify any confirmation there.
         </p>
 
-        {browserbaseStatus && (
-          <div className="p-3 bg-[#E8F0E9] border border-[#D5E0D7] rounded-xl text-xs text-[#244C3A]">
-            <span className="font-bold block mb-0.5">Backend Bridge Status:</span>
-            <span>{browserbaseStatus}</span>
-          </div>
-        )}
-
-        <div className="flex justify-end">
-          <button
-            type="button"
-            onClick={handleTestBrowserbase}
-            disabled={isTestingBrowserbase}
-            className="px-4 py-2 border border-[#5A7868]/40 bg-white hover:bg-[#E8F0E9] rounded-xl text-xs font-semibold text-[#244C3A] flex items-center gap-1.5 transition-colors cursor-pointer"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${isTestingBrowserbase ? 'animate-spin' : ''}`} />
-            <span>{isTestingBrowserbase ? 'Verifying bridge...' : 'Check Backend Agent Bridge'}</span>
-          </button>
+        <div className="inline-flex items-center gap-2 px-3 py-2 rounded-xl bg-[#E8F0E9] border border-[#D5E0D7] text-xs font-medium text-[#244C3A]">
+          <Globe className="w-3.5 h-3.5" />
+          Read-only discovery; manual registration required
         </div>
       </div>
 

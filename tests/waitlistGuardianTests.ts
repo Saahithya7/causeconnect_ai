@@ -6,6 +6,8 @@ if (typeof globalThis !== 'undefined' && typeof (globalThis as any).WebSocket ==
 import { getSupabaseServerClient } from '../src/server/supabaseServer.js';
 import { inspectOpportunityAvailability } from '../src/server/waitlistInspector.js';
 
+process.env.NODE_ENV = 'test';
+
 async function runWaitlistTests() {
   console.log('======================================================================');
   console.log('CauseConnect AI — WaitlistGuardian Verification Test Suite');
@@ -22,11 +24,11 @@ async function runWaitlistTests() {
       'Lake Cleanup Volunteer Shift'
     );
 
-    if (resultWaitlist.availabilityStatus === 'waitlisted_only' || resultWaitlist.availabilityStatus === 'spot_available') {
-      console.log('  ✓ Test 1 Passed: Authoritative status classified without false assumptions.');
+    if (resultWaitlist.availabilityStatus === 'unknown' && resultWaitlist.isBlockedOrCaptcha) {
+      console.log('  ✓ Test 1 Passed: Unapproved test domain was blocked by the production domain policy.');
       passed++;
     } else {
-      throw new Error(`Unexpected availability status: ${resultWaitlist.availabilityStatus}`);
+      throw new Error(`Expected unapproved test domain to be blocked, got: ${resultWaitlist.availabilityStatus}`);
     }
   } catch (err: any) {
     console.error('  ✗ Test 1 Failed:', err?.message);
@@ -56,7 +58,7 @@ async function runWaitlistTests() {
   try {
     console.log('Running Test 3: Cancellation monitoring accurately detects cancelled events...');
     const resultCancel = await inspectOpportunityAvailability(
-      'https://greenhyd-test.org/event',
+      'https://www.idealist.org/en/volunteer',
       'Community Clean',
       { forceSimulatedChange: 'event_cancelled' }
     );

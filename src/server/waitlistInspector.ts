@@ -36,7 +36,7 @@ export async function inspectOpportunityAvailability(
   }
 
   // 2. Controlled test domain simulation handling for offline/mock environments
-  if (options.forceSimulatedChange) {
+  if (process.env.NODE_ENV === 'test' && options.forceSimulatedChange) {
     const forced = options.forceSimulatedChange;
     return {
       availabilityStatus: forced,

@@ -9,7 +9,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import {
-  requireAuth,
+  requireVerifiedAuth,
   AuthenticatedRequest,
   getSupabaseServerClient,
   createUserSupabaseClient
@@ -17,6 +17,7 @@ import {
 import { ensureValidUuid, isValidUuid } from './src/lib/uuidHelper.js';
 import {
   searchPublicOpportunities,
+  isValidIdealistListingUrl,
   validateTargetUrl,
   withPlaywrightPage,
   standardNGOAdapter
@@ -44,14 +45,6 @@ import {
   getLatestOfficialTestRuns,
   getProposalById
 } from './src/server/registrationAgent.js';
-import {
-  getBrowserbaseStatus,
-  sanitizeSearchParams,
-  executeVolunteerDiscoveryAgent,
-  releaseAllRunningSessions,
-  cleanAndDeduplicateOpportunities,
-  BROWSERBASE_AGENT_NAME
-} from './src/server/browserbaseAgent.js';
 
 dotenv.config();
 dotenv.config({ path: path.resolve(process.cwd(), '.env.local') });
@@ -86,7 +79,7 @@ async function startServer() {
   app.get(['/health', '/api/health'], (req, res) => {
     res.json({
       status: 'ok',
-      service: 'CauseConnect AI Auto-Apply Backend',
+      service: 'CauseConnect AI Playwright Backend',
       version: '2.0.0',
       browserAutomation: 'Playwright (Chromium)',
       environment: process.env.NODE_ENV || 'development',
@@ -102,7 +95,7 @@ async function startServer() {
    * GET /api/profile/me
    * Fetches saved volunteer profile from Supabase for the authenticated user
    */
-  app.get('/api/profile/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.get('/api/profile/me', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     try {
       const userId = req.user?.id;
       if (!userId) {
@@ -125,7 +118,7 @@ async function startServer() {
    * PATCH /api/profile/me
    * Updates authenticated volunteer's profile in Supabase
    */
-  app.patch('/api/profile/me', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.patch('/api/profile/me', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     try {
       const userId = req.user?.id;
       if (!userId) {
@@ -182,8 +175,10 @@ async function startServer() {
       const { location, interests, preferredDates, maxResults } = req.body || {};
 
       if (!location || typeof location !== 'string' || location.trim().length === 0) {
+        console.warn('[API /api/events/search] Rejected a request without a valid location.');
         return res.status(400).json({
           success: false,
+          errorCode: 'invalid_request',
           error: 'Location is required (e.g. "Hyderabad, Telangana" or "San Francisco, CA")'
         });
       }
@@ -197,63 +192,90 @@ async function startServer() {
 
       res.json(searchResult);
     } catch (err: any) {
-      console.error('[API /api/events/search error]:', err);
+      console.error('[API /api/events/search] Request failed before a search result was returned.');
       res.status(500).json({
         success: false,
         opportunities: [],
+        errorCode: 'network_error',
         error: 'Failed to complete volunteer opportunity search'
       });
     }
   });
 
   /**
-   * GET /api/events/:eventId
-   * Retrieve event details and application requirements
+   * Event details are only available from a live source or persisted event record.
    */
   app.get('/api/events/:eventId', async (req, res) => {
-    try {
-      const eventId = req.params.eventId;
-      // Return details from search cache or default verified format
-      res.json({
-        success: true,
-        eventId,
-        requirements: {
-          minAge: 18,
-          backgroundCheckRequired: false,
-          allowedLocations: ['Local Area', 'Remote'],
-          registrationMethod: 'auto_apply'
-        }
-      });
-    } catch (err: any) {
-      res.status(500).json({ success: false, error: err?.message || 'Failed to get event details' });
-    }
+    res.status(404).json({
+      success: false,
+      error: 'Event details are unavailable because no matching live or persisted event record was found.'
+    });
   });
 
   // -------------------------------------------------------------
-  // Section 3 & 4 & 5: Auto-Apply Workflow Endpoints
+  // Application workflow endpoints
   // -------------------------------------------------------------
 
   /**
    * POST /api/applications/prepare
    * Pre-flight eligibility screening, missing field detection, and draft preparation
    */
-  app.post('/api/applications/prepare', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.post('/api/applications/prepare', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     try {
       const userId = req.user?.id;
       if (!userId) {
         return res.status(401).json({ success: false, error: 'Unauthorized' });
       }
 
-      const { event, userNotes, overrideProfile } = req.body || {};
+      const { event: requestedEvent, userNotes } = req.body || {};
 
-      if (!event || !event.id || !event.destinationUrl) {
+      if (!requestedEvent || typeof requestedEvent.id !== 'string' || !isValidUuid(requestedEvent.id)) {
         return res.status(400).json({
           success: false,
-          error: 'event object with id, title, and destinationUrl is required'
+          error: 'A valid persisted event ID is required.'
         });
       }
 
-      // Validate target URL for SSRF protection
+      const { data: eventRow, error: eventError } = await getSupabaseServerClient()
+        .from('opportunities')
+        .select('id, title, organization_name, source_url, min_age, max_age, background_check_required, required_skills')
+        .eq('id', requestedEvent.id)
+        .maybeSingle();
+
+      if (eventError) {
+        throw new Error(`Failed to load the selected opportunity: ${eventError.message}`);
+      }
+      if (!eventRow) {
+        return res.status(404).json({
+          success: false,
+          error: 'This opportunity is no longer available from the trusted event catalog.'
+        });
+      }
+      if (eventRow.background_check_required === null || eventRow.background_check_required === undefined) {
+        return res.status(422).json({
+          success: false,
+          error: 'The event source does not state its background-check requirement. Complete this application manually after checking with the organization.'
+        });
+      }
+
+      const event = {
+        id: String(eventRow.id),
+        title: String(eventRow.title || ''),
+        organization: String(eventRow.organization_name || ''),
+        destinationUrl: String(eventRow.source_url || ''),
+        minAge: typeof eventRow.min_age === 'number' ? eventRow.min_age : undefined,
+        maxAge: typeof eventRow.max_age === 'number' ? eventRow.max_age : undefined,
+        backgroundCheckRequired: eventRow.background_check_required === true,
+        requiredSkills: Array.isArray(eventRow.required_skills) ? eventRow.required_skills : []
+      };
+
+      if (!event.title || !event.destinationUrl || !isValidIdealistListingUrl(event.destinationUrl)) {
+        return res.status(400).json({
+          success: false,
+          error: 'This event source does not have a supported, verified Idealist listing URL. Continue manually on the source website.'
+        });
+      }
+
       const urlCheck = await validateTargetUrl(event.destinationUrl);
       if (!urlCheck.valid) {
         return res.status(400).json({
@@ -262,10 +284,7 @@ async function startServer() {
         });
       }
 
-      const result = await prepareApplicationWorkflow(userId, event, {
-        userNotes,
-        overrideProfile
-      });
+      const result = await prepareApplicationWorkflow(userId, event, { userNotes });
 
       if (!result.success) {
         return res.status(result.isIneligible ? 422 : 400).json(result);
@@ -282,7 +301,7 @@ async function startServer() {
    * POST /api/applications/:applicationId/approve
    * Explicit approval of unchanged proposal draft version and action hash
    */
-  app.post('/api/applications/:applicationId/approve', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.post('/api/applications/:applicationId/approve', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     try {
       const userId = req.user?.id;
       const applicationId = req.params.applicationId;
@@ -299,7 +318,7 @@ async function startServer() {
         });
       }
 
-      const result = approveApplicationWorkflow(applicationId, userId, {
+      const result = await approveApplicationWorkflow(applicationId, userId, {
         expectedVersion: Number(expectedVersion),
         expectedActionHash: String(expectedActionHash),
         backgroundCheckConsented: Boolean(backgroundCheckConsented)
@@ -318,9 +337,9 @@ async function startServer() {
 
   /**
    * POST /api/applications/:applicationId/execute
-   * Executes approved application using Playwright browser automation
+   * Opens the approved destination for inspection; it does not submit personal information.
    */
-  app.post('/api/applications/:applicationId/execute', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.post('/api/applications/:applicationId/execute', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     try {
       const userId = req.user?.id;
       const applicationId = req.params.applicationId;
@@ -345,11 +364,11 @@ async function startServer() {
    * GET /api/applications/:applicationId
    * Retrieve application status and verification evidence
    */
-  app.get('/api/applications/:applicationId', requireAuth, (req: AuthenticatedRequest, res) => {
+  app.get('/api/applications/:applicationId', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     try {
       const userId = req.user?.id;
       const applicationId = req.params.applicationId;
-      const appRecord = getApplicationById(applicationId);
+      const appRecord = await getApplicationById(applicationId);
 
       if (!appRecord) {
         return res.status(404).json({ success: false, error: 'Application not found' });
@@ -369,7 +388,7 @@ async function startServer() {
    * POST /api/applications/:applicationId/verify
    * Independent post-submission verification routine
    */
-  app.post('/api/applications/:applicationId/verify', requireAuth, async (req: AuthenticatedRequest, res) => {
+  app.post('/api/applications/:applicationId/verify', requireVerifiedAuth, async (req: AuthenticatedRequest, res) => {
     try {
       const userId = req.user?.id;
       const applicationId = req.params.applicationId;
@@ -378,6 +397,9 @@ async function startServer() {
       }
 
       const result = await verifyApplicationWorkflow(applicationId, userId);
+      if (!result.success) {
+        return res.status(500).json(result);
+      }
       res.json(result);
     } catch (err: any) {
       res.status(500).json({ success: false, error: err?.message || 'Verification failed' });
@@ -776,11 +798,13 @@ async function startServer() {
         maxResults
       });
       res.json({
-        success: true,
+        success: searchResult.success,
         configured: true,
         agent_name: 'CauseConnect Playwright Volunteer Finder',
         opportunities: searchResult.opportunities,
-        sourceSummary: searchResult.sourceSummary
+        sourceSummary: searchResult.sourceSummary,
+        searched_at: searchResult.checkedAt,
+        error: searchResult.error
       });
     } catch (err: any) {
       console.error('Volunteer search error:', err?.message || err);
@@ -798,7 +822,7 @@ async function startServer() {
   app.get('/api/browserbase/status', (req, res) => {
     res.json({
       configured: true,
-      agent_name: 'CauseConnect Volunteer Event Finder',
+      agent_name: 'CauseConnect Playwright Volunteer Event Finder',
       runtime: 'Playwright (Chromium)'
     });
   });
@@ -1476,14 +1500,17 @@ async function startServer() {
       let executionError = '';
 
       try {
-        const destUrl = opp.source_url || 'https://causeconnect.org';
+        const destUrl = opp.source_url;
+        if (!destUrl) {
+          throw new Error('The opportunity has no original registration URL. Manual registration is required.');
+        }
         const outcome = await withPlaywrightPage(async (page) => {
           return await standardNGOAdapter.submit(page, {
             profile,
             event: {
               id: String(opp.id),
               title: opp.title,
-              organization: opp.organization_name || 'Community Partner',
+              organization: opp.organization_name || '',
               destinationUrl: destUrl
             },
             consents: {
@@ -1496,7 +1523,7 @@ async function startServer() {
         if (outcome.status === 'verified') {
           executionSuccess = true;
           verificationEvidence = outcome.evidenceText;
-          confirmationReference = outcome.confirmationReference || `WL-CLAIM-${Math.floor(10000 + Math.random() * 90000)}`;
+          confirmationReference = outcome.confirmationReference || '';
         } else if (outcome.status === 'waitlisted') {
           executionSuccess = false;
           executionError = 'Event returned waitlisted status again; spot was filled before submission could finalize.';
@@ -1554,6 +1581,17 @@ async function startServer() {
 
       if (updateErr) {
         console.error('[Re-register DB update error]:', updateErr);
+        return res.status(500).json({
+          success: false,
+          error: `Registration was verified, but the Supabase status update failed: ${updateErr.message}`
+        });
+      }
+
+      if (!updatedReg) {
+        return res.status(500).json({
+          success: false,
+          error: 'Registration was verified, but Supabase returned no updated registration record.'
+        });
       }
 
       // Mark related notification as action_taken = 're_registered'
@@ -1564,7 +1602,7 @@ async function startServer() {
 
       res.json({
         success: true,
-        registration: updatedReg || { ...reg, status: 'confirmed', confirmation_reference: confirmationReference },
+        registration: updatedReg,
         verificationEvidence,
         confirmationReference
       });

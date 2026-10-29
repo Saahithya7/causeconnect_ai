@@ -54,6 +54,20 @@ const SUGGESTED_SKILLS = [
   'Empathy'
 ];
 
+function getAgeFromDateOfBirth(dateOfBirth: string): number {
+  const birthDate = new Date(`${dateOfBirth}T00:00:00`);
+  if (Number.isNaN(birthDate.getTime())) return 0;
+  const today = new Date();
+  let age = today.getFullYear() - birthDate.getFullYear();
+  if (
+    today.getMonth() < birthDate.getMonth() ||
+    (today.getMonth() === birthDate.getMonth() && today.getDate() < birthDate.getDate())
+  ) {
+    age--;
+  }
+  return age >= 0 ? age : 0;
+}
+
 export const ProfileView: React.FC<ProfileViewProps> = ({
   profile,
   onSaveProfile,
@@ -217,18 +231,11 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               </label>
               <input
                 type="date"
+                max={new Date().toISOString().slice(0, 10)}
                 value={formData.dateOfBirth || ''}
                 onChange={(e) => {
                   const dobVal = e.target.value;
-                  let calculatedAge = formData.age;
-                  if (dobVal) {
-                    const dob = new Date(dobVal);
-                    if (!isNaN(dob.getTime())) {
-                      const diffMs = Date.now() - dob.getTime();
-                      calculatedAge = Math.abs(new Date(diffMs).getUTCFullYear() - 1970);
-                    }
-                  }
-                  setFormData({ ...formData, dateOfBirth: dobVal, age: calculatedAge });
+                  setFormData({ ...formData, dateOfBirth: dobVal, age: dobVal ? getAgeFromDateOfBirth(dobVal) : 0 });
                 }}
                 className="w-full p-2.5 text-xs bg-[#E8F0E9]/50 border border-[#D5E0D7] rounded-xl text-[#244C3A] focus:outline-none focus:ring-2 focus:ring-[#244C3A]/30"
               />
@@ -240,11 +247,9 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
               </label>
               <input
                 type="number"
-                min="13"
-                max="105"
-                value={formData.age}
-                onChange={(e) => setFormData({ ...formData, age: parseInt(e.target.value) || 18 })}
-                required
+                value={formData.age > 0 ? formData.age : ''}
+                readOnly
+                placeholder="Set date of birth"
                 className="w-full p-2.5 text-xs bg-[#E8F0E9]/50 border border-[#D5E0D7] rounded-xl text-[#244C3A] focus:outline-none focus:ring-2 focus:ring-[#244C3A]/30"
               />
             </div>
@@ -321,7 +326,7 @@ export const ProfileView: React.FC<ProfileViewProps> = ({
                   Authorize CauseConnect AI to request volunteer background check consent on your behalf
                 </span>
                 <span className="text-[11px] text-[#244C3A]/70">
-                  Permits the Auto-Apply agent to prepare applications requiring organization safety verification.
+                  Permits the application assistant to prepare drafts requiring organization safety verification.
                 </span>
               </div>
             </label>

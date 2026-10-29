@@ -12,6 +12,11 @@ export interface SupabaseProfileRow {
   email?: string | null;
   bio?: string | null;
   location?: string | null;
+  date_of_birth?: string | null;
+  phone?: string | null;
+  has_background_check?: boolean | null;
+  background_check_consent?: boolean | null;
+  education_experience?: string | null;
   skills?: string[] | null;
   interests?: string[] | null;
   availability?: string[] | null;
@@ -123,7 +128,7 @@ export async function getProfile(userId: string): Promise<{ profile: VolunteerPr
   try {
     const { data, error } = await supabase
       .from('profiles')
-      .select('user_id, full_name, email, bio, location, skills, interests, availability, role, created_at, updated_at')
+      .select('user_id, full_name, email, bio, location, date_of_birth, phone, has_background_check, background_check_consent, education_experience, skills, interests, availability, role, created_at, updated_at')
       .eq('user_id', userId)
       .maybeSingle();
 
@@ -137,15 +142,20 @@ export async function getProfile(userId: string): Promise<{ profile: VolunteerPr
     }
 
     const row = data as SupabaseProfileRow;
+    const age = row.date_of_birth ? calculateAge(row.date_of_birth) : 0;
     const volunteerProfile: VolunteerProfile = {
-      name: row.full_name || 'Volunteer',
+      name: row.full_name || '',
       email: row.email || '',
-      age: 21,
-      city: row.location || 'Local Area',
-      hasBackgroundCheck: false,
-      preferredCauses: (row.interests as CauseCategory[]) || ['Community Service'],
-      skills: Array.isArray(row.skills) ? row.skills : ['Communication'],
-      preferredDays: (row.availability as any) || ['Saturday', 'Sunday'],
+      age,
+      dateOfBirth: row.date_of_birth || undefined,
+      phone: row.phone || undefined,
+      educationExperience: row.education_experience || undefined,
+      city: row.location || '',
+      hasBackgroundCheck: Boolean(row.has_background_check),
+      backgroundCheckConsent: Boolean(row.background_check_consent),
+      preferredCauses: (row.interests as CauseCategory[]) || [],
+      skills: Array.isArray(row.skills) ? row.skills : [],
+      preferredDays: Array.isArray(row.availability) ? row.availability as VolunteerProfile['preferredDays'] : [],
       preferredFormat: 'all',
       maxDistanceMiles: 25,
       bio: row.bio || ''
@@ -155,6 +165,20 @@ export async function getProfile(userId: string): Promise<{ profile: VolunteerPr
   } catch (err: any) {
     return { profile: null, error: err?.message || 'Error querying profile' };
   }
+}
+
+function calculateAge(dateOfBirth: string): number {
+  const birthDate = new Date(`${dateOfBirth}T00:00:00`);
+  if (Number.isNaN(birthDate.getTime())) return 0;
+  const today = new Date();
+  let age = today.getFullYear() - birthDate.getFullYear();
+  if (
+    today.getMonth() < birthDate.getMonth() ||
+    (today.getMonth() === birthDate.getMonth() && today.getDate() < birthDate.getDate())
+  ) {
+    age--;
+  }
+  return age >= 0 ? age : 0;
 }
 
 /**
@@ -178,18 +202,23 @@ export async function saveProfile(
       .maybeSingle();
 
     if (checkErr) {
-      console.warn('Profile check warning:', checkErr.message);
+      return { success: false, error: checkErr.message };
     }
 
     const payload = {
       user_id: userId,
-      full_name: profile.name || userEmail.split('@')[0],
+      full_name: profile.name || '',
       email: userEmail,
       bio: profile.bio || '',
       location: profile.city || '',
       skills: profile.skills || [],
       interests: profile.preferredCauses || [],
-      availability: profile.preferredDays || ['Saturday', 'Sunday'],
+      availability: profile.preferredDays || [],
+      date_of_birth: profile.dateOfBirth || null,
+      phone: profile.phone || null,
+      education_experience: profile.educationExperience || null,
+      has_background_check: Boolean(profile.hasBackgroundCheck),
+      background_check_consent: Boolean(profile.backgroundCheckConsent),
       updated_at: new Date().toISOString()
     };
 
@@ -292,72 +321,51 @@ export async function getOpportunitiesFromSupabase(): Promise<{
         ? row.required_skills
         : typeof row.required_skills === 'string'
         ? [row.required_skills]
-        : ['Community Outreach'];
+        : [];
 
       const category = inferCategory(row.title, row.description || '', skillsArray);
       const isRemote = row.location?.toLowerCase().includes('online') || row.location?.toLowerCase().includes('remote');
       const format: EventFormat = isRemote ? 'online' : 'in-person';
 
-      let resolvedUrl = row.source_url;
-      const lowerTitle = (row.title || '').toLowerCase();
-      const lowerOrg = (row.organization_name || '').toLowerCase();
+      const resolvedUrl = row.source_url || '';
 
-      // If source_url is missing, empty, or generic fallback, resolve authentic registration URL
-      if (!resolvedUrl || resolvedUrl === 'https://causeconnect.org' || resolvedUrl === 'public-web' || !resolvedUrl.startsWith('http')) {
-        if (lowerTitle.includes('tree') || lowerTitle.includes('canopy') || lowerOrg.includes('green hyderabad')) {
-          resolvedUrl = 'https://greenhyderabad.org/volunteer/tree-canopy-intake';
-        } else if (lowerTitle.includes('lake') || lowerTitle.includes('restoration') || lowerTitle.includes('cleanup')) {
-          resolvedUrl = 'https://greenhyd-test.org/lake-cleanup/register';
-        } else if (lowerTitle.includes('food') || lowerTitle.includes('pantry') || lowerTitle.includes('meal')) {
-          resolvedUrl = 'https://communityservice-test.org/food-bank/register';
-        } else if (lowerTitle.includes('stem') || lowerTitle.includes('code') || lowerTitle.includes('reading') || lowerOrg.includes('bright horizons')) {
-          resolvedUrl = 'https://brighthorizons-test.org/apply/reading-mentor';
-        } else if (lowerTitle.includes('health') || lowerTitle.includes('pediatric') || lowerOrg.includes('rainbow')) {
-          resolvedUrl = 'https://rainbowhealth-test.org/apply';
-        } else if (lowerTitle.includes('animal') || lowerTitle.includes('shelter') || lowerOrg.includes('paws')) {
-          resolvedUrl = 'https://hyd-animalrescue-test.org/volunteer';
-        } else {
-          resolvedUrl = `https://greenhyd-test.org/volunteer/${encodeURIComponent(row.id)}`;
-        }
-      }
-
-      let sourceDomain = 'greenhyd-test.org';
+      let sourceDomain = 'Source not provided';
       try {
-        sourceDomain = new URL(resolvedUrl).hostname.replace(/^www\./, '');
-      } catch {
-        sourceDomain = 'greenhyd-test.org';
-      }
+        if (resolvedUrl) sourceDomain = new URL(resolvedUrl).hostname.replace(/^www\./, '');
+      } catch { /* Keep source provenance explicitly unavailable. */ }
 
       return {
         id: String(row.id),
         title: row.title || 'Community Volunteer Initiative',
         organization: row.organization_name || 'Community Partner',
         category,
-        date: row.created_at
-          ? new Date(row.created_at).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })
-          : 'Saturday, Nov 14, 2026',
-        daysOfWeek: ['Saturday', 'Sunday'],
-        time: '10:00 AM - 01:00 PM',
-        location: row.location || 'Local Community Area',
-        city: row.location ? row.location.split(',')[0].trim() : 'Local Area',
+        date: 'Date not provided',
+        daysOfWeek: [],
+        time: 'Time not provided',
+        location: row.location || 'Location not provided',
+        city: '',
         format,
-        minAge: row.min_age ?? 18,
-        backgroundCheck: row.background_check_required ? 'required' : 'not-required',
+        minAge: row.min_age ?? 0,
+        backgroundCheck: row.background_check_required === true
+          ? 'required'
+          : row.background_check_required === false
+            ? 'not-required'
+            : 'not-confirmed',
         skills: skillsArray,
         description: row.description || '',
         sourceDomain,
         sourceUrl: resolvedUrl,
         lastRetrieved: row.updated_at
-          ? `Verified ${new Date(row.updated_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
-          : 'Live Database Listing',
-        slotsAvailable: 12,
-        contactEmail: `volunteer@${sourceDomain}`,
+          ? `Catalog record updated ${new Date(row.updated_at).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`
+          : 'Catalog record',
+        slotsAvailable: -1,
+        contactEmail: '',
         image: getCategoryImage(category),
-        impactStatement: row.description?.slice(0, 130) || 'Dedicated social impact community initiative.',
+        impactStatement: row.description?.slice(0, 130) || 'Impact details not provided.',
         verifiedDetails: {
-          venueVerified: true,
-          nonprofitStatusVerified: true,
-          hoursCertifiable: true
+          venueVerified: false,
+          nonprofitStatusVerified: false,
+          hoursCertifiable: false
         }
       };
     });

@@ -52,6 +52,7 @@ import { SettingsView } from './components/SettingsView';
 import { CommitMateView } from './components/CommitMateView';
 import { WaitlistGuardianView } from './components/WaitlistGuardianView';
 import { OpportunityDetailModal } from './components/OpportunityDetailModal';
+import { AutoApplyModal } from './components/AutoApplyModal';
 import { RegistrationModal } from './components/RegistrationModal';
 import { CreateOpportunityModal } from './components/CreateOpportunityModal';
 import { findAllRegisteredConflicts } from './lib/commitMateSchedule';
@@ -76,6 +77,7 @@ export default function App() {
   // Modals & UI States
   const [detailModalOpp, setDetailModalOpp] = useState<Opportunity | null>(null);
   const [registrationModalOpp, setRegistrationModalOpp] = useState<Opportunity | null>(null);
+  const [autoApplyOpp, setAutoApplyOpp] = useState<Opportunity | null>(null);
   const [isCreateOppModalOpen, setIsCreateOppModalOpen] = useState<boolean>(false);
   const [isSeeding, setIsSeeding] = useState<boolean>(false);
   const [authToast, setAuthToast] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
@@ -160,7 +162,6 @@ export default function App() {
         // Initial profile creation for newly authenticated user
         const initialProf: VolunteerProfile = {
           ...EMPTY_USER_PROFILE,
-          name: userEmail.split('@')[0],
           email: userEmail
         };
         setUserProfile(initialProf);
@@ -828,9 +829,28 @@ export default function App() {
           setDetailModalOpp(null);
           setRegistrationModalOpp(opp);
         }}
+        onRequestAutoApply={(opp) => {
+          setDetailModalOpp(null);
+          setAutoApplyOpp(opp);
+        }}
         isAlreadyRegistered={
           detailModalOpp ? registeredOppIds.includes(detailModalOpp.id) : false
         }
+      />
+
+      <AutoApplyModal
+        opportunity={autoApplyOpp}
+        isOpen={Boolean(autoApplyOpp)}
+        isAuthenticated={Boolean(supabaseUserId)}
+        onClose={() => setAutoApplyOpp(null)}
+        onPromptSignIn={() => {
+          setAutoApplyOpp(null);
+          setAppMode('signin');
+        }}
+        onEditProfile={() => {
+          setAutoApplyOpp(null);
+          setCurrentDashboardView('profile');
+        }}
       />
 
       {/* Registration Review & Approval Modal */}

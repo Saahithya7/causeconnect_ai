@@ -109,7 +109,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
         if (selectedEligibility === 'no-background-check' && opp.backgroundCheck !== 'not-required') {
           return false;
         }
-        if (selectedEligibility === 'all-ages' && opp.minAge > 16) {
+        if (selectedEligibility === 'all-ages' && (opp.minAge === 0 || opp.minAge > 16)) {
           return false;
         }
         if (selectedEligibility === 'verified-only' && !opp.verifiedDetails.venueVerified) {
@@ -177,12 +177,12 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
             Discover Opportunities
           </h1>
           <p className="text-sm sm:text-base text-[#59665C] mt-1 font-normal">
-            Browse verified opportunities in Supabase or launch the Browserbase agent to search the live web.
+            Browse the Supabase catalog or search live volunteer listings with Playwright.
           </p>
         </div>
       </div>
 
-      {/* View Switcher: Database Catalog vs Live Web Event Finder (Browserbase Agent) */}
+      {/* View Switcher: Database Catalog vs Live Playwright Discovery */}
       <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 border-b border-[#D5E0D7] pb-4">
         <div className="flex items-center gap-2 p-1 bg-[#E8F0E9] rounded-xl border border-[#D5E0D7] self-start">
           <button
@@ -224,7 +224,6 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
       {activeTab === 'browserbase' ? (
         <BrowserbaseFinder
           userProfile={userProfile}
-          onRequestRegistration={onRequestRegistration}
         />
       ) : (
         <>
@@ -483,7 +482,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-y-2 gap-x-4 text-xs">
                       <div className="flex items-center gap-2 text-[#59665C]">
                         <User className="w-4 h-4 text-[#5A7868] shrink-0" />
-                        <span>Min Age: <strong className="text-[#244C3A]">{opp.minAge}+</strong></span>
+                        <span>Min Age: <strong className="text-[#244C3A]">{opp.minAge > 0 ? `${opp.minAge}+` : 'Not specified'}</strong></span>
                       </div>
 
                       <div className="flex items-center gap-2">
@@ -492,10 +491,15 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                             <Shield className="w-4 h-4 text-[#315D48] shrink-0" />
                             <span className="text-[#315D48] font-semibold">Background Check Required</span>
                           </>
-                        ) : (
+                        ) : opp.backgroundCheck === 'not-required' ? (
                           <>
                             <Shield className="w-4 h-4 text-[#5A7868] shrink-0" />
                             <span className="text-[#59665C]">No Background Check Needed</span>
+                          </>
+                        ) : (
+                          <>
+                            <ShieldAlert className="w-4 h-4 text-amber-700 shrink-0" />
+                            <span className="text-amber-800">Background Check Status Not Stated</span>
                           </>
                         )}
                       </div>
@@ -503,6 +507,9 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
 
                     {/* Skills Chips */}
                     <div className="flex flex-wrap gap-1.5 pt-1">
+                      {opp.skills.length === 0 && (
+                        <span className="text-xs text-[#59665C]">Required skills not provided</span>
+                      )}
                       {opp.skills.map((skill, index) => (
                         <span
                           key={index}
@@ -515,7 +522,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
 
                     {/* Description excerpt */}
                     <p className="text-xs text-[#59665C] line-clamp-2 leading-relaxed">
-                      {opp.description}
+                      {opp.description || 'Description not provided'}
                     </p>
                   </div>
                 </div>
@@ -525,21 +532,25 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                   {/* Verified Provenance */}
                   <div className="flex items-center justify-between text-xs text-[#59665C] pt-3 border-t border-[#D5E0D7]">
                     <div className="flex items-center gap-1.5 hover:text-[#244C3A]">
-                      <ExternalLink className="w-3.5 h-3.5 text-[#315D48]" />
-                      <a
-                        href={opp.sourceUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="underline underline-offset-2 font-medium"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        {opp.sourceDomain}
-                      </a>
+                      {opp.sourceUrl ? (
+                        <>
+                          <ExternalLink className="w-3.5 h-3.5 text-[#315D48]" />
+                          <a
+                            href={opp.sourceUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="underline underline-offset-2 font-medium"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {opp.sourceDomain}
+                          </a>
+                        </>
+                      ) : <span>Source URL not provided</span>}
                     </div>
                     <span className="text-[11px] text-[#5A7868]">{opp.lastRetrieved}</span>
                   </div>
 
-                  {/* Action Buttons: "View Details" and "Auto Apply" */}
+                  {/* Action Buttons: view details or continue manually */}
                   <div className="grid grid-cols-2 gap-3">
                     <button
                       onClick={() => onViewDetails(opp)}
@@ -551,7 +562,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                     <button
                       onClick={() => onRequestRegistration(opp)}
                       disabled={isRegistered}
-                      aria-label={isRegistered ? 'Application Already Submitted' : `Auto Apply to ${opp.title}`}
+                      aria-label={isRegistered ? 'Application Already Recorded' : `Apply manually to ${opp.title}`}
                       className={`w-full py-2.5 px-4 rounded-xl text-xs sm:text-sm font-bold transition-all cursor-pointer text-center flex items-center justify-center gap-1.5 ${
                         isRegistered
                           ? 'bg-[#DFEAE1] text-[#244C3A]/60 cursor-not-allowed'
@@ -559,7 +570,7 @@ export const DiscoverView: React.FC<DiscoverViewProps> = ({
                       }`}
                     >
                       <Sparkles className="w-3.5 h-3.5 text-[#D6C49A] shrink-0" />
-                      <span>{isRegistered ? 'Auto Applied' : 'Auto Apply'}</span>
+                      <span>{isRegistered ? 'Application Recorded' : 'Apply Manually'}</span>
                     </button>
                   </div>
                 </div>

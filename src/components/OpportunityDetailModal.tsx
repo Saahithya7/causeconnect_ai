@@ -27,6 +27,7 @@ interface OpportunityDetailModalProps {
   isOpen: boolean;
   onClose: () => void;
   onRequestRegistration: (opp: Opportunity) => void;
+  onRequestAutoApply: (opp: Opportunity) => void;
   isAlreadyRegistered: boolean;
 }
 
@@ -37,11 +38,13 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
   isOpen,
   onClose,
   onRequestRegistration,
+  onRequestAutoApply,
   isAlreadyRegistered
 }) => {
   if (!isOpen || !opportunity) return null;
 
-  const meetsAge = userProfile.age >= opportunity.minAge;
+  const hasAgeRequirement = opportunity.minAge > 0;
+  const meetsAge = hasAgeRequirement && userProfile.age > 0 && userProfile.age >= opportunity.minAge;
   const scheduleConflict = detectScheduleConflicts(opportunity, registrations, userProfile);
 
   return (
@@ -112,10 +115,16 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
               </div>
               <div className="text-xs font-bold text-[#244C3A] flex items-center gap-1.5">
                 <User className="w-3.5 h-3.5 text-[#315D48]" />
-                <span>{opportunity.minAge}+ years</span>
+                <span>{hasAgeRequirement ? `${opportunity.minAge}+ years` : 'Not specified'}</span>
               </div>
               <div className="text-[11px] text-[#244C3A]/70 mt-0.5">
-                {meetsAge ? '✓ Your age qualifies' : '⚠️ Under required age'}
+                {!hasAgeRequirement
+                  ? 'No age criterion recorded'
+                  : userProfile.age <= 0
+                    ? 'Add date of birth to check'
+                    : meetsAge
+                      ? '✓ Your age qualifies'
+                      : '⚠️ Under required age'}
               </div>
             </div>
 
@@ -125,7 +134,7 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
               </div>
               <div className="text-xs font-bold text-[#244C3A] flex items-center gap-1.5">
                 <Users className="w-3.5 h-3.5 text-[#315D48]" />
-                <span>{opportunity.slotsAvailable} spots left</span>
+                <span>{opportunity.slotsAvailable >= 0 ? `${opportunity.slotsAvailable} spots left` : 'Not provided'}</span>
               </div>
               <div className="text-[11px] text-[#244C3A]/70 mt-0.5">Community cohort</div>
             </div>
@@ -160,6 +169,9 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
               Required Skills & Competencies
             </h4>
             <div className="flex flex-wrap gap-2">
+              {opportunity.skills.length === 0 && (
+                <span className="text-sm text-[#244C3A]/60">No required skills listed</span>
+              )}
               {opportunity.skills.map((skill) => (
                 <span
                   key={skill}
@@ -187,7 +199,13 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
               <div className="flex items-center justify-between py-1.5 border-b border-[#D5E0D7]/50">
                 <span className="text-[#244C3A]/70">Minimum Age Constraint</span>
                 <span className={`font-semibold ${meetsAge ? 'text-emerald-700' : 'text-amber-700'}`}>
-                  {meetsAge ? `✓ Age ${userProfile.age} meets requirement (Min: ${opportunity.minAge})` : `⚠️ Min age is ${opportunity.minAge}`}
+                  {!hasAgeRequirement
+                    ? 'No age requirement recorded'
+                    : userProfile.age <= 0
+                      ? `Add date of birth (minimum age ${opportunity.minAge})`
+                      : meetsAge
+                        ? `✓ Age ${userProfile.age} meets requirement (Min: ${opportunity.minAge})`
+                        : `⚠️ Min age is ${opportunity.minAge}`}
                 </span>
               </div>
 
@@ -215,17 +233,17 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
               {/* Verified details flags */}
               <div className="flex items-center justify-between py-1.5 border-b border-[#D5E0D7]/50">
                 <span className="text-[#244C3A]/70">Nonprofit Legitimacy Check</span>
-                <span className="font-semibold text-emerald-700 flex items-center gap-1">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  Verified tax-exempt organization
+                <span className={`font-semibold flex items-center gap-1 ${opportunity.verifiedDetails.nonprofitStatusVerified ? 'text-emerald-700' : 'text-amber-700'}`}>
+                  {opportunity.verifiedDetails.nonprofitStatusVerified ? <CheckCircle2 className="w-3.5 h-3.5" /> : <HelpCircle className="w-3.5 h-3.5" />}
+                  {opportunity.verifiedDetails.nonprofitStatusVerified ? 'Verified tax-exempt organization' : 'Not independently verified'}
                 </span>
               </div>
 
               <div className="flex items-center justify-between py-1.5 border-b border-[#D5E0D7]/50">
                 <span className="text-[#244C3A]/70">Volunteer Hours Certification</span>
-                <span className="font-semibold text-emerald-700 flex items-center gap-1">
-                  <CheckCircle2 className="w-3.5 h-3.5" />
-                  Eligible for certified volunteer hours log
+                <span className={`font-semibold flex items-center gap-1 ${opportunity.verifiedDetails.hoursCertifiable ? 'text-emerald-700' : 'text-amber-700'}`}>
+                  {opportunity.verifiedDetails.hoursCertifiable ? <CheckCircle2 className="w-3.5 h-3.5" /> : <HelpCircle className="w-3.5 h-3.5" />}
+                  {opportunity.verifiedDetails.hoursCertifiable ? 'Eligible for certified volunteer hours log' : 'Certification not confirmed'}
                 </span>
               </div>
 
@@ -259,15 +277,17 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-3 bg-[#E8F0E9]/60 rounded-xl text-xs text-[#244C3A]/70">
             <div className="flex items-center gap-1.5">
               <span>Source URL:</span>
-              <a
-                href={opportunity.sourceUrl}
-                target="_blank"
-                rel="noreferrer"
-                className="font-medium text-[#244C3A] underline flex items-center gap-1"
-              >
-                {opportunity.sourceDomain}
-                <ExternalLink className="w-3 h-3" />
-              </a>
+              {opportunity.sourceUrl ? (
+                <a
+                  href={opportunity.sourceUrl}
+                  target="_blank"
+                  rel="noreferrer"
+                  className="font-medium text-[#244C3A] underline flex items-center gap-1"
+                >
+                  {opportunity.sourceDomain}
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              ) : <span>Not provided</span>}
             </div>
             <div>{opportunity.lastRetrieved}</div>
           </div>
@@ -275,17 +295,27 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
 
         {/* Modal Footer Actions */}
         <div className="p-4 sm:p-6 border-t border-[#D5E0D7] bg-[#E8F0E9] flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
-          <div className="flex items-center gap-2 text-xs text-[#244C3A]/70">
+          {opportunity.contactEmail && <div className="flex items-center gap-2 text-xs text-[#244C3A]/70">
             <Mail className="w-3.5 h-3.5 text-[#315D48]" />
             <span>Coordinator: {opportunity.contactEmail}</span>
-          </div>
+          </div>}
 
-          <div className="flex items-center gap-3 w-full sm:w-auto">
+          <div className="flex items-center gap-2 w-full sm:w-auto">
             <button
               onClick={onClose}
-              className="w-1/2 sm:w-auto px-5 py-2.5 rounded-xl border border-[#D5DACA] bg-white text-xs font-semibold text-[#244C3A] hover:bg-[#E8F0E9]"
+              className="flex-1 sm:flex-none px-4 py-2.5 rounded-xl border border-[#D5DACA] bg-white text-xs font-semibold text-[#244C3A] hover:bg-[#E8F0E9]"
             >
               Close
+            </button>
+            <button
+              onClick={() => onRequestAutoApply(opportunity)}
+              disabled={!opportunity.sourceUrl}
+              title={!opportunity.sourceUrl ? 'No application source URL is available for this event.' : 'Check eligibility and review this opportunity.'}
+              className="flex-1 sm:flex-none px-4 py-2.5 rounded-xl border border-[#244C3A] bg-white text-xs font-semibold text-[#244C3A] hover:bg-[#E8F0E9] disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
+              aria-label="Apply with AI"
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>Apply with AI</span>
             </button>
             <button
               onClick={() => {
@@ -293,15 +323,15 @@ export const OpportunityDetailModal: React.FC<OpportunityDetailModalProps> = ({
                 onRequestRegistration(opportunity);
               }}
               disabled={isAlreadyRegistered}
-              aria-label={isAlreadyRegistered ? 'Application Already Submitted' : 'Auto Apply to Opportunity'}
-              className={`w-1/2 sm:w-auto px-6 py-2.5 rounded-xl text-xs font-semibold transition-all flex items-center justify-center gap-1.5 ${
+              aria-label={isAlreadyRegistered ? 'Application Already Recorded' : 'Apply manually to Opportunity'}
+              className={`flex-1 sm:flex-none px-4 py-2.5 rounded-xl text-xs font-semibold transition-all flex items-center justify-center gap-1.5 ${
                 isAlreadyRegistered
                   ? 'bg-[#E8F0E9] text-[#244C3A]/50 cursor-not-allowed'
                   : 'bg-[#244C3A] hover:bg-[#315D48] text-white shadow-xs'
               }`}
             >
               <Sparkles className="w-3.5 h-3.5 text-[#D6C49A] shrink-0" />
-              <span>{isAlreadyRegistered ? 'Application Submitted' : 'Auto Apply'}</span>
+              <span>{isAlreadyRegistered ? 'Application Recorded' : 'Apply Manually'}</span>
             </button>
           </div>
         </div>

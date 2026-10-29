@@ -66,7 +66,7 @@ export const WaitlistGuardianView: React.FC<WaitlistGuardianViewProps> = ({
   const [explicitConsent, setExplicitConsent] = useState<boolean>(false);
   const [isSubmittingClaim, setIsSubmittingClaim] = useState<boolean>(false);
   const [claimSuccessProof, setClaimSuccessProof] = useState<{
-    reference: string;
+    reference?: string;
     evidence: string;
   } | null>(null);
   const [claimError, setClaimError] = useState<string | null>(null);
@@ -166,8 +166,8 @@ export const WaitlistGuardianView: React.FC<WaitlistGuardianViewProps> = ({
 
     if (res.success) {
       setClaimSuccessProof({
-        reference: res.confirmationReference || 'WL-CLAIMED',
-        evidence: res.verificationEvidence || 'Autonomous Playwright confirmation verified.'
+        reference: res.confirmationReference,
+        evidence: res.verificationEvidence || ''
       });
       await onRefreshRegistrations();
       await loadNotifications();
@@ -846,17 +846,17 @@ export const WaitlistGuardianView: React.FC<WaitlistGuardianViewProps> = ({
                       Application Successfully Confirmed!
                     </h4>
                     <p className="text-xs text-[#59665C] max-w-md mx-auto">
-                      Playwright automation successfully registered you for <strong>{claimingReg.opportunityTitle}</strong>. Your registration record has been updated from waitlisted to confirmed.
+                      A confirmation was observed for <strong>{claimingReg.opportunityTitle}</strong> and the registration record was updated.
                     </p>
                   </div>
 
                   <div className="p-4 bg-[#E8F0E9] rounded-2xl border border-[#D5E0D7] text-left text-xs space-y-2">
-                    <div className="flex justify-between">
+                    {claimSuccessProof.reference && <div className="flex justify-between">
                       <span className="text-[#59665C]">Confirmation Code:</span>
                       <span className="font-mono font-bold text-[#244C3A]">#{claimSuccessProof.reference}</span>
-                    </div>
+                    </div>}
                     <div className="pt-2 border-t border-[#D5E0D7]/60">
-                      <span className="text-[#59665C] block mb-1">Authoritative Proof:</span>
+                      <span className="text-[#59665C] block mb-1">Observed Confirmation:</span>
                       <div className="p-2 bg-white rounded-lg border border-[#D5E0D7] font-mono text-[11px] text-[#244C3A]">
                         {claimSuccessProof.evidence}
                       </div>
